@@ -1,4 +1,4 @@
-Description: Roll back an Amazon S3 bucket to a given point in time.
+Description: Roll back an Amazon S3 bucket to a given point in time. See https://github.com/aws-samples/sample-s3-rollback-tool for details
 
 Parameters:
 
@@ -23,7 +23,7 @@ Parameters:
 
   ExecutionMode:
     Type: String
-    Description: <Bucket Rollback> mode adds delete markers to new objects created after the timestamp, removes delete markers for existing objects deleted since the timestamp, and copies older object versions that have been overwritten since the point in time. <Delete Marker Removal> mode simply removes any delete markers created after the timestamp, for objects where a delete marker is the current version.
+    Description: <Bucket Rollback> mode adds delete markers to new objects created after the timestamp, removes delete markers for existing objects deleted since the timestamp, and copies older object versions that have been overwritten since the point in time. <Delete Marker Removal> mode simply removes any delete markers created after the timestamp, for objects where a delete marker is the current version, down to the next regular object version. See https://github.com/aws-samples/sample-s3-rollback-tool for more details.
     AllowedValues:
       - "Bucket Rollback"
       - "Delete Marker Removal"

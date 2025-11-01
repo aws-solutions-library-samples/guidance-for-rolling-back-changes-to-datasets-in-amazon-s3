@@ -15,9 +15,10 @@
 - [Scenarios covered](#scenarios-covered)
   - [Bucket Rollback mode](#bucket-rollback-mode)
   - [Delete Marker Removal mode](#delete-marker-removal-mode)
-- [Deployment workflow](#deployment-workflow)
+- [Deployment workflow detail](#deployment-workflow-detail)
   - [Bucket Rollback mode](#bucket-rollback-mode-1)
   - [Delete Marker Removal mode](#delete-marker-removal-mode-1)
+  - [Mode comparison](#mode-comparision)
 - [Deployment Validation](#deployment-validation)
 - [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api)
 - [Simple demo](#simple-demo)
@@ -157,7 +158,7 @@ Scenarios differ depending on the selected mode. For each object key (name) in s
 4. **Revert *all* DELETE operations since tD:** The current version of the object is a delete marker. 
     - **Action: Delete all delete markers written since tD.** In the event of an object version having been placed since tD, only delete markers written after the latest object version will be deleted.
 
-## Deployment workflow
+## Deployment workflow detail
 
 The tool requires an inventory of the bucket or prefix in scope. If none is available, the deployment will fail.
 
@@ -173,7 +174,6 @@ The CloudFormation template creates the following resources:
    - By default, new S3 buckets have [Block Public Access](https://aws.amazon.com/s3/features/block-public-access/) enabled and [new objects are encrypted at rest with SSE-S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/default-encryption-faq.html).
 * Lambda functions to create the above resources, check versioning is enabled, determine which inventory to use, orchestrate Athena queries, create manifests in the correct formats, create S3 Batch Operations jobs, and clean up the temporary S3 bucket when the CloudFormation stack is deleted.
 * IAM roles for use by the tool.
-
 
 The tool outputs manifest files for S3 Batch Operations jobs, in the S3 path referenced in the `Manifests` output, depending on the mode selected:
 
@@ -193,11 +193,26 @@ The tool outputs manifest files for S3 Batch Operations jobs, in the S3 path ref
 
 The following flow diagram illustrates the Bucket Rollback mode workflow:
 
-<img src="images/s3rollbackflow.png" alt="Flow diagram" width="75%">
+<img src="images/s3rollbackflow.png" alt="Flow diagram" width="65%">
 
 ### Delete Marker Removal mode
 
 * **Scenario 4**:  At tD, a regular object (not a delete marker) was current, and now the current version of the object is a delete marker. **All delete markers written since tD will be deleted**. In the event of an object version having been placed since tD, only delete markers written after the latest object version will be deleted.
+
+### Mode comparision
+
+The table below compares the behaviour of the Bucket Rollback and Delete Marker Removal modes for each key, where 'V' are object versions (PUT operations), and 'DM' are delete markers (DELETE operations):
+
+| Operations before tD | Operations after tD | Bucket Rollback Mode behaviour | Remove Delete Marker mode behaviour |
+|---|---|---|---|
+| V1 | DM1 | Delete DM1 | Delete DM1
+| *None* | V1, DM1 | *No action* | Delete DM1 |
+| V1, DM1 | V2, DM2 | *No action* | Delete DM2 |
+| V1, DM1 | DM2 | *No action* | Delete DM2 |
+| V1 | DM1, V2, DM2 | Copy V1 | Delete DM2 |
+| V1 | V2 | Copy V1 | *No action*
+| *None*| V1 | Place DM | *No action*
+
 
 ## Deployment Validation
 
@@ -297,7 +312,7 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
     - For Bucket Rollback mode, This is a 2-step process:
       1. Once you have an inventory that includes the changes made by this tool, deploy the tool again in **Bucket Rollback** mode to roll back to the point in time just prior to the initial deployment. If you have S3 Metadata live inventory enabled, simply wait 15 minutes to ensure all changes have been written to the journal (`S3 Metadata support is coming soon`). 
       2. Once the above is complete, you need to re-create any delete markers removed by the original deployment, as the updated inventory has no knowledge of these. To do this, create an S3 Batch Operations job, choose the CSV manifest `scenario2_undo.csv` from the *original deployment*, leaving **Manifest includes version IDs** unchecked. Choose **Invoke AWS Lambda function** as the operation type, the function titled `<original stack name>-S3BatchOpsDeleteFunction-<unique-id>` (you can find this name in the **Resources** output of the deployment) and **Invocation schema version 2.0**. Run the job with the role titled `<original stack name>-S3BatchOpsExecutorRole--<unique-id>`.
-    - For Remove Delete Markers mode, you need to re-create any delete markers removed by the original deployment. To do this, create an S3 Batch Operations job, choose the CSV manifest `scenario4_undo.csv` from the *original deployment*, leaving **Manifest includes version IDs** unchecked. Choose **Invoke AWS Lambda function** as the operation type, the function titled `<original stack name>-S3BatchOpsDeleteFunction-<unique-id>` (you can find this name in the **Resources** output of the deployment) and **Invocation schema version 2.0**. Run the job with the role titled `<original stack name>-S3BatchOpsExecutorRole--<unique-id>`.
+    - For Delete Marker Removal mode, you need to re-create any delete markers removed by the original deployment. To do this, create an S3 Batch Operations job, choose the CSV manifest `scenario4_undo.csv` from the *original deployment*, leaving **Manifest includes version IDs** unchecked. Choose **Invoke AWS Lambda function** as the operation type, the function titled `<original stack name>-S3BatchOpsDeleteFunction-<unique-id>` (you can find this name in the **Resources** output of the deployment) and **Invocation schema version 2.0**. Run the job with the role titled `<original stack name>-S3BatchOpsExecutorRole--<unique-id>`.
 4. What happens when I delete the CloudFormation stack?
     - Any S3 Batch Operations jobs not in COMPLETE state will be cancelled.
     - All created resources will be deleted, including the temporary S3 bucket.
