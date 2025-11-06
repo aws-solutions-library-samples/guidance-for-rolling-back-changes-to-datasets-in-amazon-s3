@@ -1,7 +1,7 @@
 
 # Guidance for rolling back changes to datasets in Amazon S3
 
-#### Within-bucket recovery using S3 Versioning, to a specified point-in-time, at scale.
+#### Recovery of data in Amazon S3, at scale, using S3 Versioning.
 
 >  **Disclaimer:** Code is provided as-is, to demonstrate a concept or workflow to AWS customers. You should ensure it meets your requirements, and carefully review the S3 Batch Operations manifests and tasks before running any jobs against non-test data.
 
@@ -15,10 +15,12 @@
 - [Scenarios covered](#scenarios-covered)
   - [Bucket Rollback mode](#bucket-rollback-mode)
   - [Delete Marker Removal mode](#delete-marker-removal-mode)
+  - [Copy to Bucket mode](#copy-to-bucket-mode)
 - [Deployment workflow detail](#deployment-workflow-detail)
   - [Bucket Rollback mode](#bucket-rollback-mode-1)
   - [Delete Marker Removal mode](#delete-marker-removal-mode-1)
-  - [Mode comparison](#mode-comparision)
+  - [Mode comparison](#mode-comparison)
+  - [Copy to Bucket mode](#copy-to-bucket-mode-1)
 - [Deployment Validation](#deployment-validation)
 - [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api)
 - [Simple demo](#simple-demo)
@@ -34,17 +36,17 @@
 - [Authors](#authors)
 
 ## Overview
-If you want to revert lots of changes to a dataset in Amazon S3, as quickly as possible, this tool is for you. It can detect and revert 10 million changes, in a bucket containing 10 billion objects, in under 1 hour. Or 100 million changes in under 5 hours.
+If you want to revert lots of changes to a dataset in Amazon S3, as quickly as possible, this tool is for you. It can detect and revert 10 million changes, within a bucket containing 10 billion objects, in under 1 hour. Or 100 million changes in under 5 hours.
 
-It can also revert thousands of changes in a smaller bucket (up to millions of objects) in under 15 minutes end-to-end, including real-time inventory creation.
+It can also revert thousands of changes in a smaller bucket (up to millions of objects) in under 15 minutes end-to-end, including real-time inventory creation, or it can recreate a desired point in time into an empty bucket.
 
- Unlike other solutions, it does not require anything to be in place prior to the undesired event, other then [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html). See [Prerequisites](#prerequisites).
+>Unlike other solutions, it does not require anything to be in place prior to the undesired event, other than [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html). See [Prerequisites](#prerequisites).
 
 [Watch the demo here:](https://www.youtube.com/watch?v=2XR2trZvv7w) [![Recorded demo of the tool](https://img.youtube.com/vi/2XR2trZvv7w/mqdefault.jpg)](https://www.youtube.com/watch?v=2XR2trZvv7w)
 
-Undesired ‘soft DELETE’ (such as from [S3 Lifecycle expiry](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html)), ‘overwrite PUT’ and ‘non-overwrite PUT’ operations are all in scope - **you choose which of these to revert**. Changes to storage class (by [S3 Lifecycle](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-transition-general-considerations.html)) or to [object tags](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html) are not in scope, as these do not create new object versions.
+Undesired ‘soft DELETE’ (such as from [S3 Lifecycle expiry](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html)), ‘overwrite PUT’ and ‘non-overwrite PUT’ operations are all in scope - **you choose which of these to revert**. Changes to storage class by [S3 Lifecycle](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-transition-general-considerations.html), or to [object tags](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html), are not in scope as these do not create new object versions.
 
-The tool will not delete any data - it works by adding and removing delete markers, and copying object versions where necessary, to  revert a dataset to an earlier time with the fewest possible operations.
+The tool will not permanently delete any data - it works by adding and removing delete markers, and copying object versions where necessary, to  revert a dataset to an earlier time with the fewest possible operations.
 
 ![Rollback tool for Amazon S3 animated overview](images/s3rollbacktool-animated.gif)
 
@@ -56,7 +58,7 @@ The tool will not delete any data - it works by adding and removing delete marke
 
 You are responsible for the cost of the AWS services used while running this Guidance. 
 
-For example, as of 2025-10-31, if you use this tool against an entire bucket in the US East (N. Virginia) Region containing 1 billion objects and with an existing Amazon S3 Inventory, to roll back 1 million non-overwrite PUTs, 1 million overwrite PUTs (of objects in Standard or Intelligent-Tiering classes`*`) *and* 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $11**, detailed in the following table: 
+For example, as of 2025-11-06, if you use this tool in 'Bucket Rollback' mode against an entire bucket in the US East (N. Virginia) Region containing 1 billion objects and with an existing Amazon S3 Inventory, to roll back 1 million non-overwrite PUTs, 1 million overwrite PUTs (of objects in Standard or Intelligent-Tiering classes`*`) *and* 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $11**, detailed in the following table: 
 
 | AWS service | Dimensions | Cost [USD] |
 |-------------|------------|------------|
@@ -69,7 +71,9 @@ For example, as of 2025-10-31, if you use this tool against an entire bucket in 
 - Additional storage charges for copies are not included in the above estimates.
 - Athena charges can be expected to scale with objects in the inventory. 
 - Following the [simple demo](#simple-demo) costs $1. 
-- In testing, deleting 100 million delete markers incurred $36 in Lambda charges. S3 DELETE operations are not charged.
+- In testing, deleting 100 million delete markers incurred $36 in Lambda charges.  Lambda compute time is higher for COPY than DELETE operations, and scales with object size.
+- 'Copy to Bucket' mode copies every object (that was current at the timestamp) using S3 Batch Operations and Lambda. Cross-region copies will incur cross-region data transfer charges, and the lower throughput may increase Lambda compute time.
+- S3 does not charge for DELETE operations.
 
 
 ## Prerequisites
@@ -83,24 +87,27 @@ For example, as of 2025-10-31, if you use this tool against an entire bucket in 
     - S3 Inventory reports are supported in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format, when including all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). They must not be stored with [KMS encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html). See [Deployment workflow](#deployment-workflow) for additional detail.
 
 4. **The operations you want to roll back must be included in the inventory**. S3 Inventory reports are delivered daily (or weekly) and are eventually consistent and might not include recently added or deleted objects. This can add more than a day to the start of your recovery time. 
+5. For 'Copy to Bucket' mode, the destination bucket must already exist and have S3 Versioning enabled. This destination bucket, or the prefix in scope, **should be empty**. It can be in any AWS Region. If your destination bucket is in a different AWS Account, see the note in [Copy to Bucket mode](#copy-to-bucket-mode-1).
 
 >  Note: [S3 Metadata live inventory tables](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) provides up-to-date inventories of your buckets, at any scale. Support for these is coming soon.
 
 
 ## Deploying and Running the Guidance
 
-Before reverting changes, you should prevent further changes taking place, for example with an update to your [bucket policy](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-policies.html) to deny PUT and DELETE operations (other than by roles created by this tool). You should also [temporarily disable any lifecycle expiry rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-configuration-examples.html#lifecycle-config-conceptual-ex2) to prevent objects being deleted during recovery. Then deploy the [CloudFormation template](s3-rollback.yaml) in the same AWS Region as the S3 bucket you want to roll back. During deployment, specify:
+Before reverting changes, you may wish to prevent further changes taking place, for example with an update to your [bucket policy](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-policies.html) to deny PUT and DELETE operations (other than by roles created by this tool). You should also [temporarily disable any lifecycle expiry rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-configuration-examples.html#lifecycle-config-conceptual-ex2) to prevent objects being deleted during recovery. Then, deploy the [CloudFormation template](s3-rollback.yaml) in the same AWS Region as the S3 bucket you want to roll back or copy from. During deployment, specify:
 
-1. **Bucket**: The name of the bucket to roll back.
+1. **Bucket**: The name of the bucket to roll back or copy from.
 2. **TimeStamp**: The date and time to roll back to *in the UTC timezone*, in ISO `yyyy-mm-ddThh:mm:ss` format. For example: `2025-08-30T02:00:00`.
 3. **Prefix**: If you want to limit recovery to a specific prefix, specify it here,  or leave blank to roll back the entire bucket. This will be used to select from available S3 Inventories, and is required if S3 Inventory is being used, unless there is an inventory report with the whole bucket in scope.
 4. **Execution Mode**: 
     - **Bucket Rollback** is the default mode that creates S3 Batch Operations jobs to revert all changes in the bucket. This mode adds delete markers to new objects created after the timestamp, removes delete markers for existing objects deleted since the timestamp, and copies older object versions that have been overwritten since the point in time.
     - **Delete Marker Removal** mode simply removes delete markers placed after the timestamp, from objects where a delete marker is the current version. It will recover all objects that have been soft-deleted after the timestamp, including objects written or overwritten since the timestamp, back to their most recent version. The parameters **Copy to storage class** and **Copy using KMS key** are not used in this mode.
-4. **Start S3 Batch Operations jobs**: The tool creates one or more S3 Batch Operations jobs to revert changes, but by default it will *not* start them. If you are working with a test dataset and do not need to validate the operations, change this to `Yes`.
-5. **Copy to storage class**: The Amazon S3 storage class to copy object versions into. [If in doubt, use the Intelligent-Tiering storage class](https://catalog.workshops.aws/awscff/en-US/playbooks/storage/s3/2-choosing-storage-class). See [the documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/sc-howtoset.html) for more information.
+    - **Copy to Bucket** makes no changes to the original bucket. It recreates the precise state from an earlier point in time in *a different* bucket, by copying only the object versions which were current at the timestamp.
+4. **Start S3 Batch Operations jobs**: The tool creates one or more S3 Batch Operations jobs to carry out S3 operations, but by default it will *not* start them. If you are working with a test dataset and do not need to validate the operations or adjust permissions (e.g. [KMS](#kms-permissions)), change this to `Yes`.
+5. **Copy to storage class**: The Amazon S3 storage class to copy object versions into. [If in doubt, use the Intelligent-Tiering storage class](https://catalog.workshops.aws/awscff/en-US/playbooks/storage/s3/2-choosing-storage-class). See [the S3 documentation](https://docs.aws.amazon.com/AmazonS3/latest/userguide/sc-howtoset.html) for more information.
 6. **Copy using KMS key (optional)**: If object versions should be created using a KMS encryption key, specify it here. Leave blank for bucket default. *Permissions to KMS keys are not updated by this tool - see the* [**KMS permissions**](#kms-permissions) *section.*
 7. **Specify CSV inventory (optional)**: The S3 location of a CSV containing a current inventory of the bucket. This optional field allows you to provide a list of object versions, instead of using [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html). See the section [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api).
+8. **Destination Bucket (optional)**: For use only with 'Copy to Bucket' mode. The tool will copy all objects to this bucket that were current at the timestamp.
 
 <details>
 <summary><strong>Expand this section for detailed instructions for deploying the CloudFormation template.</strong></summary>
@@ -109,9 +116,11 @@ Before reverting changes, you should prevent further changes taking place, for e
 2. In the AWS Management Console, in the same region as your S3 bucket, find and select **CloudFormation**.
 3. Choose **Create stack - With new resources (standard)**
 4. For **Template Source**, choose, **Upload a template file**, **Choose file**, and select the `s3-rollback.yaml` file you downloaded. Choose **Next**. ![CloudFormation prerequisite - prepare template](images/cf1.png)
-5. Enter a name for the stack. This must be unique for your account and region. Enter and choose parameters as described above and in the [simple demo](#simple-demo) below. Choose **Next**. ![CloudFormation stack details](images/cf2.png)
+5. Enter a name for the stack. This must be unique for your account and region. Enter and choose parameters as described above and in the [simple demo](#simple-demo) below, then choose **Next**. ![CloudFormation stack details](images/cf2.png)
 6. Scroll to the end of the **Configure stack options** screen, check the box **I acknowledge that AWS CloudFormation might create IAM resources**, and choose **Next**. ![Configure stack options](images/cf3.png)
 7. Scroll to the end of the **Configure stack options** screen and choose **Submit**.
+
+---
 
 </details>
 
@@ -125,7 +134,7 @@ Before reverting changes, you should prevent further changes taking place, for e
 
 4. When you are ready, **run the desired S3 Batch Operations job(s).**
 
-> There may be object versions that need to be copied to complete the recovery, but are in an asynchronous [S3 storage class](https://aws.amazon.com/s3/storage-classes/) (i.e. Glacier Flexible Retrieval or Glacier Deep Archive). This tool will not retrieve and copy these, but will output their details in a CSV manifest `scenario3a.csv`, in the S3 path referenced in the `Manifests` output, that can be used with the solution [**Guidance for Automated Restore and Copy for Amazon S3 Glacier Objects**](https://github.com/aws-solutions-library-samples/guidance-for-automated-restore-and-copy-for-amazon-s3-glacier-objects).
+> There may be object versions that need to be copied to complete the recovery, but are in an asynchronous [S3 storage class](https://aws.amazon.com/s3/storage-classes/) (i.e. Glacier Flexible Retrieval or Glacier Deep Archive). This tool will not retrieve and copy these, but will output their details in a CSV manifest `scenario3a.csv` or  `scenario5a.csv`, in the S3 path referenced in the `Manifests` output, that can be used with the solution [**Guidance for Automated Restore and Copy for Amazon S3 Glacier Objects**](https://github.com/aws-solutions-library-samples/guidance-for-automated-restore-and-copy-for-amazon-s3-glacier-objects).
 
 When you no longer need the manifests and other artifacts created by the tool, see the [Cleaning up](#cleaning-up) section.
 
@@ -135,7 +144,7 @@ Users can [see the version history of a single object key in the S3 console](htt
 
 This solution enables restoration at scale, finding changes within buckets containing billions of objects in minutes (using [Amazon Athena](https://aws.amazon.com/athena/)). It then determines the most efficient operations needed to revert those changes, and creates [S3 Batch Operations](https://aws.amazon.com/s3/features/batch-operations/) jobs to enact them. *By default, these jobs are not started automatically*. Users should review the jobs and their manifests to ensure the rollback operations are desired, before proceeding to run the jobs. The jobs can be found in the S3 Batch Operations console, or the CloudFormation output.
 
-If you prefer to copy your dataset into a new bucket, as it was at a point in time, refer to [**Access a point in time with Amazon S3 Object Lambda**](https://aws.amazon.com/blogs/storage/access-a-point-in-time-with-amazon-s3-object-Lambda/) - a complimentary solution which can also provide snapshot-like read-only access without copying or changing any of your objects. Alternatively, consider the third-party software [rclone](https://rclone.org/) with the [`--s3-version-at`](https://rclone.org/s3/#s3-version-at) parameter.
+If you prefer to copy your dataset into an empty bucket or prefix, as it was at a point in time, choose the 'Copy to Bucket' mode. Note that this will require copying *every* object that was a current version at the chosen timestamp, and is likely to be significantly slower and more expensive than rolling back in place. 
 
 
 ## Scenarios covered
@@ -157,6 +166,11 @@ Scenarios differ depending on the selected mode. For each object key (name) in s
 
 4. **Revert *all* DELETE operations since tD:** The current version of the object is a delete marker. 
     - **Action: Delete all delete markers written since tD.** In the event of an object version having been placed since tD, only delete markers written after the latest object version will be deleted.
+
+### Copy to Bucket mode
+5. **Recreate tD in the destination bucket:**
+    - **Action: Copy all objects that were current version at tD to the destination bucket.**
+    - **Exception:** If the the desired version is in an an asynchronous S3 storage class (Glacier Flexible Retrieval or Glacier Deep Archive), include this in the `scenario5a.csv` manifest. You can then use [**Guidance for Automated Restore and Copy for Amazon S3 Glacier Objects**](https://github.com/aws-solutions-library-samples/guidance-for-automated-restore-and-copy-for-amazon-s3-glacier-objects) to retrieve those object versions and copy them in place.
 
 ## Deployment workflow detail
 
@@ -183,9 +197,9 @@ The tool outputs manifest files for S3 Batch Operations jobs, in the S3 path ref
 * **Scenario 2:**  Keys where there are only delete markers (no new objects) after tD. **These delete markers will be deleted.**
     * `scenario2-undo.csv` will also be created so that these can be recreated if needed. See [FAQ #3](#faqs).
 * **Scenarios 3a, b and c:** Keys where there was an object (not a delete marker) at the tD, and there is current version newer than at tD. Excludes keys covered by scenarios 1 and 2. **The desired VersionID will be copied to the same key, making it the current version.**
-    * **3a:** Desired VersionID is in Glacier Flexible Retreival or Deep Archive class and needs to be restored from async. **This tool will not copy these objects**, but output its details in the `scenario3a.csv` manifest that can be used with [**Guidance for Automated Restore and Copy for Amazon S3 Glacier Objects**](https://github.com/aws-solutions-library-samples/guidance-for-automated-restore-and-copy-for-amazon-s3-glacier-objects).
+    * **3a:** Desired VersionID is in Glacier Flexible Retrieval or Deep Archive class and needs to be restored from async. **This tool will not copy these objects**, but output its details in the `scenario3a.csv` manifest that can be used with [**Guidance for Automated Restore and Copy for Amazon S3 Glacier Objects**](https://github.com/aws-solutions-library-samples/guidance-for-automated-restore-and-copy-for-amazon-s3-glacier-objects).
         * Note that as ListObjectVersions and S3 Metadata don't report Intelligent Tiering tier, objects versions that need to be retrieved before being copied from the *opt-in* asynchronous Archive and Deep Archive tiers won’t be included here unless an S3 Inventory source is used. Instead they will be included in scenario 3b or 3c, and an attempt made to copy them. These copy attempts will fail with `403: InvalidObjectState` 
-    * **3b:** Desired VersionID <= 5 GiB. These objects will copied with the CopyObject API, with an S3 Batch Operations Copy job.
+    * **3b:** Desired VersionID <= 5 GiB. These objects will be copied with the CopyObject API, with an S3 Batch Operations Copy job.
     * **3c:** Desired VersionID > 5 GiB. These objects require special handling. A separate S3 Batch Operations Lambda job will perform these copies, reusing code from the solution at https://aws.amazon.com/blogs/storage/copying-objects-greater-than-5-gb-with-amazon-s3-batch-operations/ .
             
 
@@ -199,7 +213,7 @@ The following flow diagram illustrates the Bucket Rollback mode workflow:
 
 * **Scenario 4**:  At tD, a regular object (not a delete marker) was current, and now the current version of the object is a delete marker. **All delete markers written since tD will be deleted**. In the event of an object version having been placed since tD, only delete markers written after the latest object version will be deleted.
 
-### Mode comparision
+### Mode comparison
 
 The table below compares the behaviour of the Bucket Rollback and Delete Marker Removal modes for each key, where 'V' are object versions (PUT operations), and 'DM' are delete markers (DELETE operations):
 
@@ -212,6 +226,37 @@ The table below compares the behaviour of the Bucket Rollback and Delete Marker 
 | V1 | DM1, V2, DM2 | Copy V1 | Delete DM2 |
 | V1 | V2 | Copy V1 | *No action*
 | *None*| V1 | Place DM | *No action*
+
+
+### Copy to Bucket mode
+
+* **Scenario 5**: Every object that was a current version at tD will be copied to the destination bucket. Objects where the current version was a delete marker will not be copied. All copies are done using a Lambda function, to allow for cross-region copies.
+
+>Note: If the destination S3 bucket is in another AWS account, then you must also apply a resource level bucket policy to the S3 bucket with the required permissions. See the following S3 bucket policy example with the minimum required permissions:
+
+```
+{
+    "Version": "2012-10-17",
+    "Id": "PolicyName",
+    "Statement": [
+        {
+            "Sid": "Allow Cross Account Copy",
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::1234567890:root"
+            },
+            "Action": [
+                "s3:PutObject",
+                "s3:PutObjectAcl",
+	 "s3:PutObjectTagging"
+            ],
+            "Resource": "arn:aws:s3:::DESTINATION_BUCKET/*"
+        }
+    ]
+}
+```
+>`1234567890` in the bucket policy Principal is the source account AWS Account-ID. It is recommended to set Object Ownership on the destination account bucket to Bucket owner enforced. If you have a special use case that requires using ACLs, set it to Bucket owner preferred to ensure that the destination account owns the objects.
+
 
 
 ## Deployment Validation
@@ -291,7 +336,7 @@ Permissions required:
 - KMS decrypt for object versions to be copied
 - KMS encrypt for the key you selected copies to be encrypted with (or the bucket default)
 
-KMS permissions are *not* required for the scenario 1 and 2 and 4 jobs, as DELETE operations do not encrypt or decrypt data.
+KMS permissions are *not* required for scenario 1, 2 and 4 jobs, as DELETE operations do not encrypt or decrypt data.
 
 ## AWS Lambda concurrency reservations
 
@@ -306,7 +351,7 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
     - S3 Versioning must have been enabled before the time of the event. Object versions cannot be recovered if they have since been permanently deleted (either directly or by a lifecycle rule). See [Prerequisites](#prerequisites).
     - If you don’t have an S3 Inventory from after the event, you will need to enable this and wait for it to create an inventory of your S3 bucket. Or you can LIST the contents of your bucket into a CSV - see [**Creating a real-time inventory using the ListObjectVersions API**](#creating-a-real-time-inventory-using-the-listobjectversions-api).
 2. What about changes that took place after the inventory was created, or after the rollback process was started?
-    - This tool will take the appropriate action to revert changes, based on the available inventory information at the time of deployment. The impact of a subsequent change depends on its nature, and whether it took place before or after the specific S3 Batch Operations job (created  by this rollback tool) took its action. However, in all cases, running the rollback tool *again*, with an inventory that includes new changes, will correctly revert the new changes. Note: If the new inventory includes copies made by this tool (scenario 3), those copies will be repeated as it isn't possible to tell from an inventory that the current object version's data is identical to the desired version.
+    - This tool will take the appropriate action to revert changes, based on the available inventory information at the time of deployment. The impact of a subsequent change depends on its nature, and whether it took place before or after the specific S3 Batch Operations job (created  by this rollback tool) took its action. However, in all cases, running the rollback tool *again*, with an inventory that includes new changes, will correctly revert the new changes. Note: If the new inventory includes copies made by this tool (scenarios 3 and 5), those copies will be repeated as it isn't possible to tell from an inventory that the current object version's data is identical to the desired version.
 3. I used this tool to roll back my bucket, and want to undo the changes. Can I do that?
     - Yes, provided you have not yet deleted the CloudFormation stack from the original deployment. 
     - For Bucket Rollback mode, This is a 2-step process:
@@ -328,13 +373,16 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
         - Or, if you only want to remove delete markers from objects that were present (with a current version that was not a delete marker) at tD, select the default **Bucket Rollback** mode, leave **Start S3 Batch Operations Jobs** as `FALSE`, and then only run the scenario 2 job. Note this will not act on keys where an object has been PUT after tD, as this falls under scenario 3.
 9. Does this work with S3 Replication?
     - Yes. If you have used S3 Replication to make a copy of your data in another bucket, you could use this tool to revert either the source or destination bucket. Note that permanent delete operations (including of delete markers) are not replicated, and replication of new delete markers is [optional](https://docs.aws.amazon.com/AmazonS3/latest/userguide/delete-marker-replication.html).
-    1. If you want to roll back both source and destination buckets:
+    - If you want to roll back both source and destination buckets:
         1. Ensure replication of delete markers is enabled in your replication rule.
         2. Roll back the source bucket to tD, running all Batch Operations jobs. The operations carried out by the Scenario 1 and 3 jobs will be replicated.
         3. Roll back the destination bucket to tD, running only the Scenario 2 job, as these operations will *not* have been replicated.
-    2. If you only want to roll back the destination (for example, you are failing over to using the destination bucket):
+    - If you only want to roll back the destination (for example, you are failing over to using the destination bucket):
         1. [Disable the replication rule](https://docs.aws.amazon.com/AmazonS3/latest/userguide/replication-add-config.html#replication-config-min-rule-config) to prevent further replication from source to destination.
         2. Using an inventory that includes all replicated changes, roll back the destination bucket to tD.
+    - You may also want to consider using the [Replication Validation Tool for S3](https://github.com/aws-samples/sample-RVT-S3) to continuously validate that your destination bucket (or prefix) is a complete copy of your source.
+10. For 'Copy to Bucket' mode, why does the destination bucket need S3 Versioning enabled?
+    - This tool will copy objects into the destination bucket without considering the current state of objects in the destination. If versioning is not enabled, these copies could result in overwrites causing permanent and irreversable data loss.
 
 
 ## Cleanup
@@ -370,6 +418,9 @@ To clean up, delete the CloudFormation stack. This will delete any CSV manifests
     - Added Remove Delete Marker mode
     - 4x improvement in Lambda function performance
     - updated readme.md to comply with new repository requirements.
+- 2025-11-06
+    - Added 'Copy to Bucket' mode
+    - Updated GitHub references following the move to https://github.com/aws-solutions-library-samples/
 
 ## Notices
 

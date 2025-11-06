@@ -1,4 +1,4 @@
-Description: Roll back an Amazon S3 bucket to a given point in time. See https://github.com/aws-samples/sample-s3-rollback-tool for details. Tracking ref SO9651
+Description: Roll back an Amazon S3 bucket to a given point in time. See https://github.com/aws-solutions-library-samples/sample-s3-rollback-tool/ for details. AWS Solutions Library reference SO9651
 
 Parameters:
 
@@ -23,11 +23,12 @@ Parameters:
 
   ExecutionMode:
     Type: String
-    Description: <Bucket Rollback> mode adds delete markers to new objects created after the timestamp, removes delete markers for existing objects deleted since the timestamp, and copies older object versions that have been overwritten since the point in time. <Delete Marker Removal> mode simply removes any delete markers created after the timestamp, for objects where a delete marker is the current version, down to the next regular object version. See https://github.com/aws-samples/sample-s3-rollback-tool for more details.
+    Description: <Bucket Rollback> mode adds delete markers to new objects created after the timestamp, removes delete markers for existing objects deleted since the timestamp, and copies older object versions that have been overwritten since the point in time. <Delete Marker Removal> mode simply removes any delete markers created after the timestamp, for objects where a delete marker is the current version, down to the next regular object version. <Copy to Bucket> mode copies all objects present at the timestamp to a different bucket. See https://github.com/aws-solutions-library-samples/sample-s3-rollback-tool/ for more details.
     AllowedValues:
       - "Bucket Rollback"
       - "Delete Marker Removal"
-    ConstraintDescription: Please choose either "Bucket Rollback" or "Delete Marker Removal".
+      - "Copy to Bucket"
+    ConstraintDescription: Please choose either "Bucket Rollback", "Delete Marker Removal" or "Copy to Bucket".
     Default: "Bucket Rollback"
   
   StorageClass:
@@ -66,6 +67,12 @@ Parameters:
     ConstraintDescription: Please enter an S3 location ending in .csv e.g. s3://mybucket/prefix/inventory.csv
     Default: ""
 
+  DestinationBucket:
+    Type: String
+    Description: S3 bucket to use as the destination, if using "Copy to Bucket" mode.
+    AllowedPattern: '([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])?'
+    Default: ""
+
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
@@ -85,6 +92,7 @@ Metadata:
           - StorageClass
           - KMSKey
           - InventoryCSVLocation
+          - DestinationBucket
 
     ParameterLabels:
         BucketName:
@@ -103,6 +111,8 @@ Metadata:
           default: Start S3 Batch Operations jobs
         InventoryCSVLocation:
           default: Specify CSV inventory
+        DestinationBucket:
+          default: Destination Bucket
 
 Conditions:
   CreateInventory: !Equals
@@ -122,6 +132,39 @@ Conditions:
   WantDMRemoval: !Equals
     - !Ref ExecutionMode
     - "Delete Marker Removal"
+
+  WantCopy: !Equals
+    - !Ref ExecutionMode
+    - "Copy to Bucket"
+
+  WantRollbackOrCopy: !Or
+    - !Equals
+      - !Ref ExecutionMode
+      - "Bucket Rollback"
+    - !Equals
+      - !Ref ExecutionMode
+      - "Copy to Bucket"
+
+  WantRollbackOrDMRemoval: !Or
+    - !Equals
+      - !Ref ExecutionMode
+      - "Bucket Rollback"
+    - !Equals
+      - !Ref ExecutionMode
+      - "Delete Marker Removal"
+
+Rules:
+
+  CheckForDestinationBucket:
+    RuleCondition: !Equals
+      - !Ref ExecutionMode
+      - "Copy to Bucket"
+    Assertions:
+      - Assert: !Not
+        - !Equals
+          - !Ref DestinationBucket
+          - ""
+        AssertDescription: Destination Bucket must be specified if using Copy to Bucket mode.
 
 Resources:
 
@@ -231,31 +274,40 @@ Resources:
               cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
               return
             
-            bucket = event["ResourceProperties"]["Bucket"]
-            
-            # Ensure bucket has versioning enabled.
+            s3 = boto3.client("s3")
             
             try:
             
-              s3 = boto3.client("s3")
-              response = s3.get_bucket_versioning(Bucket = bucket)
-            
-              if response.get("Status") != "Enabled":
-                reason = f"Bucket '{bucket}' does not have versioning enabled."
-                cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
-                
-              else:
-                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-             
+              for b in ["Source", "Destination"]:
+              
+                bucket = event["ResourceProperties"].get(f"{b}Bucket")
+                print(f"Check Versioning for {b} Bucket '{bucket}'")
+                if bucket == "":
+                  print("Empty, skipping")
+                  continue 
+              
+                # Ensure bucket has versioning enabled.
+              
+                response = s3.get_bucket_versioning(Bucket = bucket)
+          
+                if response.get("Status") != "Enabled":
+                  print("Valid bucket but versioning not enabled.")
+                  reason = f"{b} Bucket '{bucket}' does not have versioning enabled."
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
+                  return
+                  
+                print("Valid bucket and versioning enabled.")
+              
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
               return          
             
             except botocore.exceptions.ClientError as error:
             
               if error.response['Error']['Code'] == "NoSuchBucket":
-                reason = f"Bucket '{bucket}' does not exist."
+                reason = f"{b} Bucket '{bucket}' does not exist."
             
               else:
-                reason = f"Error listing inventory configurations for bucket '{bucket}': {error.response['Error']['Message']}"
+                reason = f"Error checking versioning for {b} bucket '{bucket}': {error.response['Error']['Message']}"
             
               cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
               return
@@ -292,6 +344,7 @@ Resources:
                   - "s3:GetBucketVersioning"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
+                  - !If [ WantCopy, !Sub "arn:${AWS::Partition}:s3:::${DestinationBucket}", !Ref "AWS::NoValue" ]
   
   AthenaResultsBucket:
     Type: "AWS::S3::Bucket"
@@ -357,18 +410,25 @@ Resources:
             invs = []
             
             bucket = event["ResourceProperties"]["Bucket"]
-            timestamp = datetime.fromisoformat(event["ResourceProperties"]["TimeStamp"])
-            if timestamp.tzinfo is None:
-              timestamp = timestamp.replace(tzinfo=timezone.utc)
-              
-            scope = event["ResourceProperties"]["Prefix"]
-            
-            session = boto3.Session()
-            s3 = session.client("s3")
             
             try:
             
+              timestamp = datetime.fromisoformat(event["ResourceProperties"]["TimeStamp"])
+              if timestamp.tzinfo is None:
+                timestamp = timestamp.replace(tzinfo=timezone.utc)
+              
+              scope = event["ResourceProperties"]["Prefix"]
+              
+              session = boto3.Session()
+              s3 = session.client("s3")
+              
               response = s3.list_bucket_inventory_configurations(Bucket = bucket)
+            
+            except ValueError as error:
+              
+              reason = f"Error parsing timestamp '{event["ResourceProperties"]["TimeStamp"]}': {error}"
+              cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
+              return
             
             except botocore.exceptions.ClientError as error:
               
@@ -729,7 +789,7 @@ Resources:
                 cast(from_iso8601_timestamp(last_modified_date) as TIMESTAMP) last_modified_date,
                 size,
                 storage_class,
-                cast(null as varchar) intelligent_tiering_access_tier,
+                cast('' as varchar) intelligent_tiering_access_tier,
                 '' dt
             FROM
                 ${GlueDB}.csv_import
@@ -762,7 +822,7 @@ Resources:
                 last_modified_date,
                 size,
                 storage_class,
-                intelligent_tiering_access_tier
+                coalesce(intelligent_tiering_access_tier, '') as intelligent_tiering_access_tier
             FROM
                 ${GlueDB}.pit_table
             WHERE
@@ -835,7 +895,7 @@ Resources:
 
   CreateDesiredTable:
     Type: "AWS::Athena::NamedQuery"
-    Condition: WantRollback
+    Condition: WantRollbackOrCopy
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Amazon Athena table to hold the desired version / delete markers of every file under the prefix"
@@ -871,7 +931,7 @@ Resources:
 
   CreateDesiredVersionsTable:
     Type: "AWS::Athena::NamedQuery"
-    Condition: WantRollback
+    Condition: WantRollbackOrCopy
     Properties:
       Database: !Ref GlueDatabase
       Description: "Creates an Amazon Athena table to hold the desired versions of every file under the prefix"
@@ -922,7 +982,7 @@ Resources:
                 l.is_delete_marker as latest_is_delete_marker,
                 d.size as size,
                 d.storage_class as storage_class,
-                coalesce(d.intelligent_tiering_access_tier, '') as intelligent_tiering_access_tier
+                d.intelligent_tiering_access_tier as intelligent_tiering_access_tier
             from ${GlueDB}.desired_versions d
             inner join ${GlueDB}.latest_versions l on
                 d.key = l.key
@@ -1305,6 +1365,72 @@ Resources:
             
         - GlueDB: !Ref GlueDatabase
           ResultsBucket: !Ref AthenaResultsBucket
+
+  CreateScenario5aTable:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: WantCopy
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Athena table to address Scenario 5a"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Athena table to address Scenario 5a;
+            -- VersionID from PIT is in GFR/GDA class. Need to restore from async.
+
+            CREATE TABLE ${GlueDB}.scenario5a_keys WITH (
+                format = 'TEXTFILE',
+                field_delimiter = ',',
+                write_compression = 'NONE',
+                external_location = 's3://${ResultsBucket}/Tables/scenario5a_keys_table/'
+            ) as
+                select
+                    '${Bucket}' as bucket,
+                    url_encode(key) as key,
+                    version_id
+                from
+                    ${GlueDB}.desired_versions
+                
+                where
+                    storage_class in('GLACIER', 'DEEP_ARCHIVE') or
+                    intelligent_tiering_access_tier in ('ARCHIVE', 'DEEP_ARCHIVE')
+
+        - GlueDB: !Ref GlueDatabase
+          ResultsBucket: !Ref AthenaResultsBucket
+          Bucket: !Ref BucketName
+
+  CreateScenario5bTable:
+    Type: "AWS::Athena::NamedQuery"
+    Condition: WantCopy
+    Properties:
+      Database: !Ref GlueDatabase
+      Description: "Creates an Athena table to address Scenario 5b"
+      WorkGroup: !Ref AthenaWorkGroup
+      QueryString: !Sub
+        - |
+            -- Creates an Athena table to address Scenario 5b;
+            -- Objects not in archive.
+
+            CREATE TABLE ${GlueDB}.scenario5b_keys WITH (
+                format = 'TEXTFILE',
+                field_delimiter = ',',
+                write_compression = 'NONE',
+                external_location = 's3://${ResultsBucket}/Tables/scenario5b_keys_table/'
+            ) as
+                select
+                    '${Bucket}' as bucket,
+                    url_encode(key) as key,
+                    version_id
+                from
+                    ${GlueDB}.desired_versions
+
+                where
+                    storage_class not in('GLACIER', 'DEEP_ARCHIVE') and
+                    intelligent_tiering_access_tier not in ('ARCHIVE', 'DEEP_ARCHIVE')
+
+        - GlueDB: !Ref GlueDatabase
+          ResultsBucket: !Ref AthenaResultsBucket
+          Bucket: !Ref BucketName
 
   ManifestMaker:
     Type: "AWS::Lambda::Function"
@@ -1810,8 +1936,8 @@ Resources:
               # Description of job
               description = event["ResourceProperties"]["Description"]
               
-              # Location to which files should be copied
-              target_bucket = event["ResourceProperties"].get("TargetBucket")
+              # Location where files should be copied to
+              destination_bucket = event["ResourceProperties"].get("DestinationBucket")
               
               # Role for S3 Batch Operations to use
               role_arn = event["ResourceProperties"]["S3BatchOpsRoleArn"]
@@ -1875,10 +2001,33 @@ Resources:
                       "Description" : f"S3 Point in Time Rollback - {description} - for CloudFormation Stack '{event['StackId']}'"
                   }
                   
-                  if target_bucket: # A Copy job
+                  if function_arn: # A Lambda job (either Add / Remove DMs, or Scenario 5b Copy job)
+                      
+                      kwargs["Operation"] = {
+                          "LambdaInvoke": {
+                              "FunctionArn": function_arn,
+                              "InvocationSchemaVersion" : "2.0"
+                          }
+                      }
+                      
+                      user_args = {}
+                      
+                      if destination_bucket: # A Scenario 5b copy job
+                          user_args["DestinationBucket"] = destination_bucket
+                      
+                      if storage_class: # A Scenario 5b copy with storage class specified
+                          user_args["StorageClass"] = storage_class
+                      
+                      if kms_key: # A Scenario 5b copy with KMS encryption
+                          user_args["KMSKey"] = kms_key
+                          
+                      if user_args:
+                          kwargs["Operation"]["LambdaInvoke"]["UserArguments"] = user_args
+                
+                  else: # A Scenario3b copy job
                       kwargs["Operation"] = {
                           "S3PutObjectCopy": {
-                              "TargetResource": f"arn:aws:s3:::{target_bucket}",
+                              "TargetResource": f"arn:aws:s3:::{destination_bucket}",
                               "MetadataDirective": "COPY",
                               "StorageClass": storage_class,
                               "CannedAccessControlList": "bucket-owner-full-control"
@@ -1888,21 +2037,7 @@ Resources:
                       if kms_key: # Want KMS encryption
                           kwargs["Operation"]["S3PutObjectCopy"]["SSEAwsKmsKeyId"] = kms_key
                           kwargs["Operation"]["S3PutObjectCopy"]["NewObjectMetadata"] = { "SSEAlgorithm" : "KMS" }
-                  
-                  else: # A Lambda job (either Delete, or >5GB Copy job)
-                      kwargs["Operation"] = {
-                          "LambdaInvoke": {
-                              "FunctionArn": function_arn,
-                              "InvocationSchemaVersion" : "2.0",
-                          }
-                      }
                       
-                      if storage_class: # A copy with storage class specified
-                          kwargs["Operation"]["LambdaInvoke"]["UserArguments"]["StorageClass"] = storage_class
-                      
-                      if kms_key: # Want KMS encryption
-                          kwargs["Operation"]["LambdaInvoke"]["UserArguments"]["KMSKey"] = kms_key
-                
                   response = s3control.create_job(**kwargs)
                   
                   url = f"https://{os.environ['AWS_REGION']}.console.aws.amazon.com/s3/jobs/{response['JobId']}"
@@ -1990,19 +2125,24 @@ Resources:
               - Effect: Allow
                 Action:
                   - "s3:GetObject*"
-                  - "s3:PutObject*"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/${Prefix}*"
                   - !Sub "${AthenaResultsBucket.Arn}/Manifests/*"
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject*"
+                Resource:
+                  - !Join [ "", [ !Sub "arn:${AWS::Partition}:s3:::", !If [ WantCopy, !Ref DestinationBucket, !Ref BucketName ],  !Sub "/${Prefix}*" ] ]
                   - !Sub "${AthenaResultsBucket.Arn}/Reports/*"
               - Effect: Allow
                 Action:
                   - "lambda:InvokeFunction"
                 Resource:
-                  - !GetAtt S3BatchOpsDeleteFunction.Arn
-                  - !If [ WantRollback, !GetAtt S3BatchOpsCopyFunction.Arn, !Ref "AWS::NoValue" ]
+                  - !If [ WantRollbackOrDMRemoval, !GetAtt S3BatchOpsDeleteFunction.Arn, !Ref "AWS::NoValue" ]
+                  - !If [ WantRollbackOrCopy, !GetAtt S3BatchOpsCopyFunction.Arn, !Ref "AWS::NoValue" ]
 
   S3BatchOpsDeleteFunction:
+    Condition: WantRollbackOrDMRemoval
     Type: "AWS::Lambda::Function"
     Properties:
       Runtime: python3.13
@@ -2073,6 +2213,7 @@ Resources:
               return results
 
   S3BatchOpsDeleteFunctionRole:
+    Condition: WantRollbackOrDMRemoval
     Type: "AWS::IAM::Role"
     Properties:
       AssumeRolePolicyDocument:
@@ -2108,7 +2249,7 @@ Resources:
 
   S3BatchOpsCopyFunction:
     Type: "AWS::Lambda::Function"
-    Condition: WantRollback
+    Condition: WantRollbackOrCopy
     Properties:
       Runtime: python3.13
       MemorySize: 2048
@@ -2138,9 +2279,10 @@ Resources:
               for task in event['tasks']:
           
                   task_id = task['taskId']
-                  s3_bucket = task['s3Bucket']
+                  s3_source_bucket = task['s3Bucket']
                   s3_key = unquote_plus(task['s3Key'])
                   s3_version_id = task['s3VersionId']
+                  s3_destination_bucket = event['job']['userArguments']['DestinationBucket']
                   storage_class = event['job']['userArguments']['StorageClass']
                   kms_key = event['job']['userArguments'].get("KMSKey")
           
@@ -2149,16 +2291,16 @@ Resources:
                   try:
                   
                       # Get Metadata and Tags
-                      response = s3.head_object(Bucket = s3_bucket, Key = s3_key, VersionId = s3_version_id)
+                      response = s3.head_object(Bucket = s3_source_bucket, Key = s3_key, VersionId = s3_version_id)
                       metadata = response['Metadata']
                       
-                      response = s3.get_object_tagging(Bucket = s3_bucket, Key = s3_key, VersionId = s3_version_id)
+                      response = s3.get_object_tagging(Bucket = s3_source_bucket, Key = s3_key, VersionId = s3_version_id)
                       tag_set = response['TagSet']
                       
                       # Up to 1,000 threads for transferring, each part size max 250MB.
                       config = TransferConfig(max_concurrency = 1000, multipart_chunksize = 250 * 1024 * 1024)
                       
-                      copy_source = { 'Bucket' : s3_bucket, 'Key' : s3_key, 'VersionId' : s3_version_id }
+                      copy_source = { 'Bucket' : s3_source_bucket, 'Key' : s3_key, 'VersionId' : s3_version_id }
                       extra_args = {
                           "StorageClass" : storage_class,
                           "Metadata" : metadata,
@@ -2170,10 +2312,10 @@ Resources:
                           extra_args["ServerSideEncryption"] = "aws:kms"
                       
                       # Copy the object                      
-                      s3.copy(copy_source, s3_bucket, s3_key, ExtraArgs = extra_args, Config = config)
+                      s3.copy(copy_source, s3_destination_bucket, s3_key, ExtraArgs = extra_args, Config = config)
                       
                       # Set tags                      
-                      s3.put_object_tagging(Bucket = s3_bucket, Key = s3_key, Tagging = { 'TagSet' : tag_set })
+                      s3.put_object_tagging(Bucket = s3_destination_bucket, Key = s3_key, Tagging = { 'TagSet' : tag_set })
           
                       result['resultCode'] = "Succeeded"
                       result['resultString'] = "Copied"
@@ -2184,7 +2326,7 @@ Resources:
                       error_message = e.response['Error']['Message']
                   
                       result['resultCode'] = "PermanentFailure"
-                      result['resultString'] = f"Error copying {s3_key} with version {s3_version_id} in bucket {s3_bucket}: {error_code} - {error_message}"
+                      result['resultString'] = f"Error copying {s3_key} with version {s3_version_id} from bucket {s3_source_bucket} to bucket {s3_destination_bucket}: {error_code} - {error_message}"
           
                   results['results'].append(result)
           
@@ -2192,7 +2334,7 @@ Resources:
 
   S3BatchOpsCopyFunctionRole:
     Type: "AWS::IAM::Role"
-    Condition: WantRollback
+    Condition: WantRollbackOrCopy
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -2211,9 +2353,13 @@ Resources:
               - Effect: Allow
                 Action:
                   - "s3:GetObject*"
-                  - "s3:PutObject*"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3:::${BucketName}/${Prefix}*"
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject*"
+                Resource:
+                  - !If [ WantCopy, !Sub "arn:${AWS::Partition}:s3:::${DestinationBucket}/${Prefix}*", !Sub "arn:${AWS::Partition}:s3:::${BucketName}/${Prefix}*" ]
               - Effect: Allow
                 Action:
                   - "logs:CreateLogGroup"
@@ -2231,7 +2377,8 @@ Resources:
     Properties:
       ServiceTimeout: 60
       ServiceToken: !GetAtt CheckVersioning.Arn
-      Bucket: !Ref BucketName
+      SourceBucket: !Ref BucketName
+      DestinationBucket: !If [ WantCopy, !Ref DestinationBucket, !Ref "AWS::NoValue" ]
 
   ExecuteClean:
     Type: "Custom::ExecuteCleanerFunction"
@@ -2343,7 +2490,7 @@ Resources:
 
   ExecuteCreateDesiredTable:
     Type: "Custom::ExecuteCreateDesiredTableFunction"
-    Condition: WantRollback
+    Condition: WantRollbackOrCopy
     DependsOn:
     - ExecuteClean
     - ExecuteCreateAllVersionsTable
@@ -2356,7 +2503,7 @@ Resources:
 
   ExecuteCreateDesiredVersionsTable:
     Type: "Custom::ExecuteCreateDesiredVersionsTableFunction"
-    Condition: WantRollback
+    Condition: WantRollbackOrCopy
     DependsOn:
     - ExecuteClean
     - ExecuteCreateDesiredTable
@@ -2479,7 +2626,7 @@ Resources:
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario3bTable/"
 
   ExecuteCreateScenario3cTable:
-    Type: "Custom::ExecuteCreateScenario3TableFunction"
+    Type: "Custom::ExecuteCreateScenario3cTableFunction"
     Condition: WantRollback
     DependsOn:
     - ExecuteClean
@@ -2518,6 +2665,32 @@ Resources:
       WorkGroup: !Ref AthenaWorkGroup
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario4UndoTable/"
 
+  ExecuteCreateScenario5aTable:
+    Type: "Custom::ExecuteCreateScenario5aTableFunction"
+    Condition: WantCopy
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateDesiredVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario5aTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario5aTable/"
+
+  ExecuteCreateScenario5bTable:
+    Type: "Custom::ExecuteCreateScenario5bTableFunction"
+    Condition: WantCopy
+    DependsOn:
+    - ExecuteClean
+    - ExecuteCreateDesiredVersionsTable
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt QueryExecutor.Arn
+      QueryID: !GetAtt CreateScenario5bTable.NamedQueryId
+      WorkGroup: !Ref AthenaWorkGroup
+      ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateScenario5bTable/"
+
   ExecuteManifestMaker:
     Type: "Custom::ExecuteManifestMakerFunction"
     DependsOn:
@@ -2538,6 +2711,8 @@ Resources:
         - !If [ WantRollback, "scenario3c", !Ref "AWS::NoValue" ]
         - !If [ WantDMRemoval, "scenario4", !Ref "AWS::NoValue" ]
         - !If [ WantDMRemoval, "scenario4_undo", !Ref "AWS::NoValue" ]
+        - !If [ WantCopy, "scenario5a", !Ref "AWS::NoValue" ]
+        - !If [ WantCopy, "scenario5b", !Ref "AWS::NoValue" ]
       Dependency:
         - !If [WantRollback, !GetAtt ExecuteCreateScenario1Table.State, !Ref "AWS::NoValue"]
         - !If [WantRollback, !GetAtt ExecuteCreateScenario2Table.State, !Ref "AWS::NoValue"]
@@ -2547,6 +2722,8 @@ Resources:
         - !If [WantRollback, !GetAtt ExecuteCreateScenario3cTable.State, !Ref "AWS::NoValue"]
         - !If [WantDMRemoval, !GetAtt ExecuteCreateScenario4Table.State, !Ref "AWS::NoValue"]
         - !If [WantDMRemoval, !GetAtt ExecuteCreateScenario4UndoTable.State, !Ref "AWS::NoValue"]
+        - !If [WantCopy, !GetAtt ExecuteCreateScenario5aTable.State, !Ref "AWS::NoValue"]
+        - !If [WantCopy, !GetAtt ExecuteCreateScenario5bTable.State, !Ref "AWS::NoValue"]
 
   ExecuteS3BatchOpsDeleteCreator1:
     Type: "Custom::ExecuteS3BatchOpsCreator"
@@ -2600,9 +2777,9 @@ Resources:
       ReportBucket: !GetAtt AthenaResultsBucket.Arn
       ReportPrefix: "Reports/scenario3b"
       Description: "Scenario 3b - Restore older object versions"
-      TargetBucket: !Ref BucketName
+      DestinationBucket: !Ref BucketName
       StorageClass: !Ref StorageClass
-      KMSKey: !If [WantKMS, !Ref KMSKey, !Ref "AWS::NoValue" ]
+      KMSKey: !If [ WantKMS, !Ref KMSKey, !Ref "AWS::NoValue" ]
       S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
       StartJob: !Ref StartS3BatchOperationsJobs
 
@@ -2621,6 +2798,7 @@ Resources:
       ReportBucket: !GetAtt AthenaResultsBucket.Arn
       ReportPrefix: "Reports/scenario3c"
       Description: "Scenario 3c - Restore older object versions > 5GB"
+      DestinationBucket: !Ref BucketName
       FunctionArn: !GetAtt S3BatchOpsCopyFunction.Arn
       StorageClass: !Ref StorageClass
       KMSKey: !If [WantKMS, !Ref KMSKey, !Ref "AWS::NoValue" ]
@@ -2643,6 +2821,28 @@ Resources:
       ReportPrefix: "Reports/scenario4"
       Description: "Scenario 4 - Remove latest DMs"
       FunctionArn: !GetAtt S3BatchOpsDeleteFunction.Arn
+      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      StartJob: !Ref StartS3BatchOperationsJobs
+
+  ExecuteS3BatchOpsCopyCreator5b:
+    Type: "Custom::ExecuteS3BatchOpsCreator"
+    Condition: WantCopy
+    DependsOn:
+    - ExecuteClean
+    - ExecuteManifestMaker
+    Properties:
+      ServiceTimeout: 60
+      ServiceToken: !GetAtt S3BatchOpsCreator.Arn
+      ManifestBucket: !Ref AthenaResultsBucket
+      ManifestKey: "Manifests/scenario5b.csv"
+      HasVersionIds: True
+      ReportBucket: !GetAtt AthenaResultsBucket.Arn
+      ReportPrefix: "Reports/scenario5b"
+      Description: "Scenario 5b - Copy objects"
+      DestinationBucket: !Ref DestinationBucket
+      FunctionArn: !GetAtt S3BatchOpsCopyFunction.Arn
+      StorageClass: !Ref StorageClass
+      KMSKey: !If [WantKMS, !Ref KMSKey, !Ref "AWS::NoValue" ]
       S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
       StartJob: !Ref StartS3BatchOperationsJobs
 
@@ -2680,6 +2880,16 @@ Outputs:
     Condition: WantRollback
     Description: ARN of the IAM Role used by the S3 Batch Operations Copy Job (Scenario 3c)
     Value: !GetAtt S3BatchOpsCopyFunctionRole.Arn
+
+  S3BatchOperationsCopy5bJob:
+    Condition: WantCopy
+    Description: AWS Management Console link for S3 Batch Operations Copy Job (Scenario 5b)
+    Value: !GetAtt ExecuteS3BatchOpsCopyCreator5b.Output
+    
+  CopyRole5b:
+    Condition: WantCopy
+    Description: ARN of the IAM Role used by the S3 Batch Operations Copy Job (Scenario 5b)
+    Value: !GetAtt S3BatchOpsExecutorRole.Arn
 
   S3BatchOperationsDelete4Job:
     Condition: WantDMRemoval
