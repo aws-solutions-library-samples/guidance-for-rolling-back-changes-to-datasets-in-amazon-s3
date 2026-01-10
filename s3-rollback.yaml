@@ -2651,10 +2651,18 @@ Resources:
       Code:
         ZipFile: |
           import boto3
+          import botocore.config
           from urllib.parse import unquote_plus
           from botocore.exceptions import ClientError
           
-          s3 = boto3.client('s3')
+          # Configure S3 client with 10 retry attempts
+          client_config = botocore.config.Config(
+              retries={
+                  'max_attempts': 10,
+                  'mode': 'standard'
+              }
+          )
+          s3 = boto3.client('s3', config=client_config)
           
           def handler(event, context):
           
