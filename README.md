@@ -73,7 +73,7 @@ The tool will not permanently delete any data. In the default 'Bucket Rollback' 
 
 You are responsible for the cost of the AWS services used while running this Guidance. 
 
-For example, as of 2025-11-17, if you use this tool in 'Bucket Rollback' mode against an entire bucket in the US East (N. Virginia) Region containing 1 billion objects and with S3 Metadata live inventory enabled or an existing Amazon S3 Inventory, to roll back 1 million non-overwrite PUTs, 1 million overwrite PUTs (of objects in Standard or Intelligent-Tiering classes`*`) *and* 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $11**, detailed in the following table: 
+For example, as of 2025-11-17, if you use this tool in 'Bucket Rollback' mode against an entire bucket in the US East (N. Virginia) Region containing 1 billion objects and with S3 Metadata live inventory enabled or an existing Amazon S3 Inventory, to roll back 1 million non-overwrite PUTs, 1 million overwrite PUTs (of objects in Standard or Intelligent-Tiering classes`*`) *and* 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $12**, detailed in the following table: 
 
 | AWS service | Dimensions | Cost [USD] |
 |-------------|------------|------------|
@@ -81,7 +81,7 @@ For example, as of 2025-11-17, if you use this tool in 'Bucket Rollback' mode ag
 | [Amazon S3](https://aws.amazon.com/s3/pricing/) | COPY requests | $5 |
 | [S3 Batch Operations](https://aws.amazon.com/s3/pricing/) | Jobs and objects processed | $4 |
 | [AWS Lambda](https://aws.amazon.com/lambda/pricing/) | Compute time and requests | $1 |
-| [S3 Metadata](https://aws.amazon.com/s3/pricing/) (if enabled) | Journal table updates | $0.30 |
+| [S3 Metadata](https://aws.amazon.com/s3/pricing/) (if enabled) | Journal table updates | $0.90 |
 
 - `*` Objects in these S3 storage classes are not subject to a per-GB retrieval charge when copied. 
 - Additional storage charges for copies are not included in the above estimates.
