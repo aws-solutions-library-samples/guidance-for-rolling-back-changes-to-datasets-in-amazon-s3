@@ -40,7 +40,9 @@ If you want to revert undesired changes to a dataset in Amazon S3, as quickly as
 
 The only [Prerequisites](#prerequisites) are that [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) is enabled, and the desired versions still exist. If your bucket, or the prefix in scope, has up to 10 million objects, you can get started in under an hour after the undesired event by [creating a real-time inventory](#creating-a-real-time-inventory-using-the-listobjectversions-api). For buckets with [S3 Metadata live inventory tables](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) enabled and up to 3 billion objects in scope for rollback, you can get started in only 15 minutes. If you don't have S3 Metadata enabled, or have even more objects in scope, you can get started in under 48 hours with an [S3 Inventory report](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html).
 
-[Watch a 10 minute demo here:](https://www.youtube.com/watch?v=2XR2trZvv7w) [![Recorded demo of the tool](https://img.youtube.com/vi/2XR2trZvv7w/mqdefault.jpg)](https://www.youtube.com/watch?v=2XR2trZvv7w)
+[Watch a short demo of 'Bucket Rollback' mode here:](https://www.youtube.com/watch?v=2XR2trZvv7w) [![Recorded demo of the tool](https://img.youtube.com/vi/2XR2trZvv7w/mqdefault.jpg)](https://www.youtube.com/watch?v=2XR2trZvv7w)
+
+[Or a demo of 'Delete Marker Removal' mode, including use of S3 Metadata:](https://www.youtube.com/watch?v=NQqkJV0w7iA) [![Recorded demo of the tool](https://img.youtube.com/vi/NQqkJV0w7iA/mqdefault.jpg)](https://www.youtube.com/watch?v=NQqkJV0w7iA)
 
 Undesired ‘soft DELETE’ (such as from [S3 Lifecycle expiry](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html)), ‘overwrite PUT’ and ‘non-overwrite PUT’ operations are all in scope - **you choose which of these to revert**. Changes to storage class by [S3 Lifecycle transitions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-transition-general-considerations.html), or to [object tags](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html), are not in scope as these do not create new object versions.
 
@@ -82,7 +84,7 @@ For example, as of 2025-11-17, if you use this tool in 'Bucket Rollback' mode ag
 2. To return the state of a dataset to an earlier time, this tool exposes or copies desired versions of objects. **These desired versions must still exist**. See the section [Ensuring recoverability](#ensuring-recoverability) for more information.
 
 3. A current inventory list of the bucket is required.
-    - Ideally, [S3 Metadata live inventory](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) is enabled on your bucket. For buckets with over a million objects, this is the fastest way for the tool to learn the current state of the bucket. S3 Metadata support has been tested up to 3 billion objects.
+    - Ideally, [S3 Metadata live inventory](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) is enabled on your bucket. For buckets with over a million objects, this is the fastest way for the tool to learn the current state of the bucket. [S3 Metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/metadata-tables-overview.html) support has been tested up to 3 billion objects.
         - [Amazon S3 table buckets integration with AWS analytics services](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-aws.html) must be enabled.
         - The S3 Metadata table configuration must not use KMS encryption. If it does, or you have any other challenges with using S3 Metadata, you can choose not to use it during deployment.
         - *If you have more than 3B objects in scope, and want to use S3 Metadata with this tool, please contact the [authors](#authors) either directly or via your AWS account team.*
@@ -228,7 +230,7 @@ The table below compares the behaviour of the Bucket Rollback and Delete Marker 
 | *None* | V1, DM1 | *No action* | Delete DM1, exposing V1 |
 | V1, DM1 | V2, DM2 | *No action* | Delete DM2, exposing V2 |
 | V1, DM1 | DM2 | *No action* | Delete DM2, object remains soft-deleted due to DM1 |
-| V1 | DM1, V2, DM2 | Copy V1 | Delete DM2, exposing V2 |
+| V1 | DM1, V2, DM2 | Copy V1 (as current version V3) | Delete DM2, exposing V2 |
 | V1 | V2 | Copy V1 (as current version V3) | *No action*
 | *None*| V1 | Place DM, key is soft deleted | *No action*
 
