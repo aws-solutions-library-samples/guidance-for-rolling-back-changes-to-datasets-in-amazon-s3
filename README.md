@@ -40,9 +40,24 @@ If you want to revert undesired changes to a dataset in Amazon S3, as quickly as
 
 The only [Prerequisites](#prerequisites) are that [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) is enabled, and the desired versions still exist. If your bucket, or the prefix in scope, has up to 10 million objects, you can get started in under an hour after the undesired event by [creating a real-time inventory](#creating-a-real-time-inventory-using-the-listobjectversions-api). For buckets with [S3 Metadata live inventory tables](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) enabled and up to 3 billion objects in scope for rollback, you can get started in only 15 minutes. If you don't have S3 Metadata enabled, or have even more objects in scope, you can get started in under 48 hours with an [S3 Inventory report](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html).
 
-[Watch a short demo of 'Bucket Rollback' mode here:](https://www.youtube.com/watch?v=2XR2trZvv7w) [![Recorded demo of the tool](https://img.youtube.com/vi/2XR2trZvv7w/mqdefault.jpg)](https://www.youtube.com/watch?v=2XR2trZvv7w)
+<table>
+<tr>
+<td width="50%">
 
-[Or a demo of 'Delete Marker Removal' mode, including use of S3 Metadata:](https://www.youtube.com/watch?v=NQqkJV0w7iA) [![Recorded demo of the tool](https://img.youtube.com/vi/NQqkJV0w7iA/mqdefault.jpg)](https://www.youtube.com/watch?v=NQqkJV0w7iA)
+**Demo of 'Bucket Rollback' mode:**
+
+[![Recorded demo of the tool](https://img.youtube.com/vi/2XR2trZvv7w/mqdefault.jpg)](https://www.youtube.com/watch?v=2XR2trZvv7w)
+
+</td>
+<td width="50%">
+
+**Demo of 'Delete Marker Removal' mode, including use of S3 Metadata:**
+
+[![Recorded demo of the tool](https://img.youtube.com/vi/NQqkJV0w7iA/mqdefault.jpg)](https://www.youtube.com/watch?v=NQqkJV0w7iA)
+
+</td>
+</tr>
+</table>
 
 Undesired ‘soft DELETE’ (such as from [S3 Lifecycle expiry](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html)), ‘overwrite PUT’ and ‘non-overwrite PUT’ operations are all in scope - **you choose which of these to revert**. Changes to storage class by [S3 Lifecycle transitions](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-transition-general-considerations.html), or to [object tags](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-tagging.html), are not in scope as these do not create new object versions.
 
