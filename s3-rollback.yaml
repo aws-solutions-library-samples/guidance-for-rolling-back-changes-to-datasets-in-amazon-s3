@@ -60,15 +60,6 @@ Parameters:
     ConstraintDescription: Please select YES or NO.
     Default: "NO"
 
-  UseMetadata:
-    Type: String
-    Description: If S3 Metadata is enabled on the bucket, should the tool attempt to use it?
-    AllowedValues:
-      - "YES"
-      - "NO"
-    ConstraintDescription: Please select YES or NO.
-    Default: "YES"
-
   InventoryCSVLocation:
     Type: String
     Description: S3 location of a CSV inventory file to use instead of S3 Inventory or Metadata (e.g. s3://bucket/prefix/inventory.csv). Can be generated with https://github.com/aws-samples/sample-s3-listobjectversions-to-csv
@@ -81,6 +72,10 @@ Parameters:
     Description: S3 bucket to use as the destination, if using "Copy to Bucket" mode.
     AllowedPattern: '([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])?'
     Default: ""
+
+  ExistingKmsKeyIdOrArn:
+    Type: String
+    Description: Only provide when Metadata is encrypted by Customer managed Key, leave empty if Metadata is SSE-S3 Encrypted.
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -103,18 +98,19 @@ Metadata:
           - KMSKey
           - InventoryCSVLocation
           - DestinationBucket
+          - ExistingKmsKeyIdOrArn
 
     ParameterLabels:
         BucketName:
           default: Bucket
+        ExistingKmsKeyIdOrArn:
+          default: S3 Metadata tables KMS key
         Prefix:
           default: Prefix
         TimeStamp:
           default: Timestamp
         ExecutionMode:
           default: Execution Mode
-        UseMetadata:
-          default: Use S3 Metadata tables
         StorageClass:
           default: Copy to storage class
         KMSKey:
@@ -127,6 +123,7 @@ Metadata:
           default: Destination Bucket
 
 Conditions:
+  UseKmsUpdateKeyPolicy: !Not [!Equals [!Ref ExistingKmsKeyIdOrArn, ""]]
   CreateInventory: !Equals
     - !Ref InventoryCSVLocation
     - ""
@@ -136,7 +133,7 @@ Conditions:
       - !Ref InventoryCSVLocation
       - ""
     - !Equals
-      - !Ref UseMetadata
+      - "YES"
       - "YES"
 
   UseInventoryCSV: !Not
@@ -174,8 +171,17 @@ Conditions:
       - "Delete Marker Removal"
       
   UseMetadata: !Equals
-    - !Ref UseMetadata
     - "YES"
+    - "YES"
+
+  CreateKMSUpdate: !Not [!Equals [!Ref ExistingKmsKeyIdOrArn, ""]]
+  CreateMetadataFinderWithKMSUpdate: !And
+    - !Condition CreateInventoryFromMetadata
+    - !Condition CreateKMSUpdate
+
+  CreateMetadataFinderNoKMSUpdate: !And
+    - !Condition CreateInventoryFromMetadata
+    - !Not [ !Condition CreateKMSUpdate ]
 
 Rules:
 
@@ -401,8 +407,8 @@ Resources:
       Permissions: ["SELECT"]
       Resource:
         TableResource:
-          CatalogId: !GetAtt ExecuteMetadataFinder.Catalog
-          DatabaseName: !GetAtt ExecuteMetadataFinder.NameSpace
+          CatalogId: !If [ CreateKMSUpdate, !GetAtt ExecuteMetadataFinderWithKMSUpdate.Catalog, !GetAtt ExecuteMetadataFinderNoKMSUpdate.Catalog ]
+          DatabaseName: !If [ CreateKMSUpdate, !GetAtt ExecuteMetadataFinderWithKMSUpdate.NameSpace, !GetAtt ExecuteMetadataFinderNoKMSUpdate.NameSpace ]
           TableWildcard: {}
        
   AthenaWorkGroup:
@@ -496,13 +502,25 @@ Resources:
                   namespace = response_data["NameSpace"],
                   name = response_data[t]
                 )["encryptionConfiguration"]
-                
                 if enc_response["sseAlgorithm"] == "aws:kms":
+                  kms_key_arn = enc_response.get("kmsKeyArn", "")
+                  expected_key = event["ResourceProperties"].get("KmsKeyIdOrArn", "")
+                  # If caller provided a key, ensure it matches the metadata table KMS key (best effort).
+                  if expected_key and kms_key_arn and expected_key != kms_key_arn and not kms_key_arn.endswith("/" + expected_key) and not kms_key_arn.endswith(":" + expected_key):
+                    reason = f"Cannot read S3 Metadata. {t} table is encrypted with KMS key {kms_key_arn}, which does not match provided key {expected_key}."
+                    cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
+                    return
                 
-                  reason = f"Cannot read S3 Metadata. {t} table is encrypted with KMS key {enc_response['kmsKeyArn']}"
-                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)         
-                  return
-              
+                  # Proof: verify this function can at least describe the key (and therefore is likely allowed by key policy).
+                  try:
+                    kms = boto3.client("kms")
+                    kms.describe_key(KeyId=(kms_key_arn or expected_key))
+                  except botocore.exceptions.ClientError as e:
+                    reason = f"Cannot read S3 Metadata. {t} table is encrypted with KMS key {kms_key_arn}. KMS access check failed: {str(e)}"
+                    cfnresponse.send(event, context, cfnresponse.FAILED, {}, None , False, reason)
+                    return
+                
+                  # KMS-encrypted metadata tables are supported; continue.
               cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
               return
             
@@ -558,6 +576,20 @@ Resources:
                   - "s3tables:GetTableEncryption"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3/table/*"
+        - !If
+          - UseKmsUpdateKeyPolicy
+          - PolicyName: kms-update-key-policy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - kms:DescribeKey
+                    - kms:GetKeyPolicy
+                    - kms:PutKeyPolicy
+                  Resource: !Ref ExistingKmsKeyIdOrArn
+          - !Ref AWS::NoValue
+
 
   InventoryFinder:
     Type: "AWS::Lambda::Function"
@@ -1278,9 +1310,9 @@ Resources:
             )
             
         - GlueDB: !Ref GlueDatabase
-          NameSpace: !GetAtt ExecuteMetadataFinder.NameSpace
-          Inventory: !GetAtt ExecuteMetadataFinder.Inventory
-          Journal: !GetAtt ExecuteMetadataFinder.Journal
+          NameSpace: !If [ CreateKMSUpdate, !GetAtt ExecuteMetadataFinderWithKMSUpdate.NameSpace, !GetAtt ExecuteMetadataFinderNoKMSUpdate.NameSpace ]
+          Inventory: !If [ CreateKMSUpdate, !GetAtt ExecuteMetadataFinderWithKMSUpdate.Inventory, !GetAtt ExecuteMetadataFinderNoKMSUpdate.Inventory ]
+          Journal: !If [ CreateKMSUpdate, !GetAtt ExecuteMetadataFinderWithKMSUpdate.Journal, !GetAtt ExecuteMetadataFinderNoKMSUpdate.Journal ]
           ResultsBucket: !Ref AthenaResultsBucket
 
   CreateAllVersionsTable:
@@ -2895,17 +2927,31 @@ Resources:
       ServiceToken: !GetAtt BucketCleaner.Arn
       Bucket: !Ref AthenaResultsBucket
 
-  ExecuteMetadataFinder:
+
+  ExecuteMetadataFinderWithKMSUpdate:
     Type: "Custom::ExecuteMetadataFinderFunction"
-    Condition: CreateInventoryFromMetadata
+    Condition: CreateMetadataFinderWithKMSUpdate
     DependsOn:
-    - ExecuteClean
+      - ExecuteClean
+      - KMSUpdate
     Properties:
       ServiceTimeout: 60
       ServiceToken: !GetAtt MetadataFinder.Arn
       Bucket: !Ref BucketName
-      UseMetadata: !Ref UseMetadata
-     
+      UseMetadata: "YES"
+      KmsKeyIdOrArn: !Ref ExistingKmsKeyIdOrArn
+
+  ExecuteMetadataFinderNoKMSUpdate:
+    Type: "Custom::ExecuteMetadataFinderFunction"
+    Condition: CreateMetadataFinderNoKMSUpdate
+    DependsOn:
+      - ExecuteClean
+    Properties:
+      ServiceTimeout: 60
+      ServiceToken: !GetAtt MetadataFinder.Arn
+      Bucket: !Ref BucketName
+      UseMetadata: "YES"
+      KmsKeyIdOrArn: !Ref ExistingKmsKeyIdOrArn
   ExecuteInventoryFinder:
     Type: "Custom::ExecuteInventoryFinderFunction"
     Condition: CreateInventory
@@ -2915,7 +2961,7 @@ Resources:
       Bucket: !Ref BucketName
       Prefix: !Ref Prefix
       TimeStamp: !Ref TimeStamp
-      NameSpace: !If [ CreateInventoryFromMetadata, !GetAtt ExecuteMetadataFinder.NameSpace, "default" ]
+      NameSpace: !If [ CreateInventoryFromMetadata, !If [ CreateKMSUpdate, !GetAtt ExecuteMetadataFinderWithKMSUpdate.NameSpace, !GetAtt ExecuteMetadataFinderNoKMSUpdate.NameSpace ], "default" ]
       ResultsBucketArn: !GetAtt AthenaResultsBucket.Arn
       
   ExecuteCreateInventoryPITTable:
@@ -2930,7 +2976,7 @@ Resources:
       WorkGroup: !Ref AthenaWorkGroup
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateInventoryPITTable/"
       SkipIfMetadataFound: true
-      NameSpace: !If [ CreateInventoryFromMetadata, !GetAtt ExecuteMetadataFinder.NameSpace, "default" ]
+      NameSpace: !If [ CreateInventoryFromMetadata, !If [ CreateKMSUpdate, !GetAtt ExecuteMetadataFinderWithKMSUpdate.NameSpace, !GetAtt ExecuteMetadataFinderNoKMSUpdate.NameSpace ], "default" ]
 
   ExecuteCreateMetadataPITTable:
     Type: "Custom::ExecuteCreateMetadataPITTableFunction"
@@ -2946,7 +2992,7 @@ Resources:
       WorkGroup: !Ref AthenaWorkGroup
       ResultsLocation: !Sub "s3://${AthenaResultsBucket}/Results/CreateMetadataPITTable/"
       OnlyIfMetadataFound: true
-      NameSpace: !GetAtt ExecuteMetadataFinder.NameSpace
+      NameSpace: !If [ CreateKMSUpdate, !GetAtt ExecuteMetadataFinderWithKMSUpdate.NameSpace, !GetAtt ExecuteMetadataFinderNoKMSUpdate.NameSpace ]
 
   ExecuteInventoryCopier:
     Type: "Custom::ExecuteCreateCSVImportTableFunction"
@@ -3382,6 +3428,209 @@ Resources:
       KMSKey: !If [WantKMS, !Ref KMSKey, !Ref "AWS::NoValue" ]
       S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
       StartJob: !Ref StartS3BatchOperationsJobs
+
+  KMSUpdateFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: CreateKMSUpdate
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: kms-update-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-KMSUpdate:*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-KMSUpdate:log-stream:*"
+        - !If
+          - UseKmsUpdateKeyPolicy
+          - PolicyName: kms-update-key-policy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - kms:DescribeKey
+                    - kms:GetKeyPolicy
+                    - kms:PutKeyPolicy
+                  Resource: !Ref ExistingKmsKeyIdOrArn
+          - !Ref AWS::NoValue
+
+  KMSUpdateFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateKMSUpdate
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-KMSUpdate"
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt KMSUpdateFunctionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import boto3
+          import traceback
+
+          kms = boto3.client("kms")
+
+          def _send_response(event, context, status, data, physical_resource_id=None, reason=None):
+              response_url = event["ResponseURL"]
+              body = {
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch Log Stream: {context.log_stream_name}",
+                  "PhysicalResourceId": physical_resource_id or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {}
+              }
+              json_body = json.dumps(body).encode("utf-8")
+              req = urllib.request.Request(
+                  response_url,
+                  data=json_body,
+                  method="PUT",
+                  headers={"content-type": "", "content-length": str(len(json_body))}
+              )
+              with urllib.request.urlopen(req) as resp:
+                  resp.read()
+
+          def _safe_sid(event):
+              # Deterministic SID per stack + logical id, sanitized.
+              raw = f"{event.get('StackId','')}-{event.get('LogicalResourceId','')}"
+              safe = []
+              for ch in raw:
+                  if ch.isalnum():
+                      safe.append(ch)
+                  else:
+                      safe.append("_")
+              sid = "AllowPrincipalUseOfKey_" + "".join(safe)
+              return sid[:200]
+
+          def _load_policy(key_id, policy_name):
+              resp = kms.get_key_policy(KeyId=key_id, PolicyName=policy_name)
+              policy_str = resp["Policy"]
+              policy = json.loads(policy_str)
+              if "Statement" not in policy or policy["Statement"] is None:
+                  policy["Statement"] = []
+              if not isinstance(policy["Statement"], list):
+                  policy["Statement"] = [policy["Statement"]]
+              if "Version" not in policy:
+                  policy["Version"] = "2012-10-17"
+              return policy
+
+          def _put_policy(key_id, policy_name, policy):
+              kms.put_key_policy(
+                  KeyId=key_id,
+                  PolicyName=policy_name,
+                  Policy=json.dumps(policy)
+              )
+
+          def _ensure_statement(policy, sid, principal_arn):
+              # Remove any existing statement with the same Sid, then re-add desired statement.
+              new_statements = []
+              for st in policy.get("Statement", []):
+                  if isinstance(st, dict) and st.get("Sid") == sid:
+                      continue
+                  new_statements.append(st)
+
+              allow_stmt = {
+                  "Sid": sid,
+                  "Effect": "Allow",
+                  "Principal": {"AWS": principal_arn},
+                  "Action": [
+                      "kms:Decrypt",
+                      "kms:GenerateDataKey",
+                      "kms:DescribeKey"
+                  ],
+                  "Resource": "*"
+              }
+              new_statements.append(allow_stmt)
+              policy["Statement"] = new_statements
+              return policy
+
+          def _remove_statement(policy, sid):
+              statements = policy.get("Statement", [])
+              new_statements = []
+              removed = False
+              for st in statements:
+                  if isinstance(st, dict) and st.get("Sid") == sid:
+                      removed = True
+                      continue
+                  new_statements.append(st)
+              policy["Statement"] = new_statements
+              return policy, removed
+
+          def handler(event, context):
+              physical_id = event.get("PhysicalResourceId") or f"{event['StackId']}/{event['LogicalResourceId']}"
+              try:
+                  props = event.get("ResourceProperties", {})
+                  key_id = props["KeyId"]
+                  policy_name = props.get("PolicyName", "default")
+                  principal_arn = props["PrincipalArn"]
+                  sid = props.get("StatementSid") or _safe_sid(event)
+
+                  request_type = event["RequestType"]
+
+                  if request_type in ["Create", "Update"]:
+                      policy = _load_policy(key_id, policy_name)
+                      policy = _ensure_statement(policy, sid, principal_arn)
+                      _put_policy(key_id, policy_name, policy)
+
+                      _send_response(
+                          event, context, "SUCCESS",
+                          data={"StatementSid": sid, "PrincipalArn": principal_arn},
+                          physical_resource_id=physical_id
+                      )
+                      return
+
+                  if request_type == "Delete":
+                      # Best effort cleanup
+                      policy = _load_policy(key_id, policy_name)
+                      policy, removed = _remove_statement(policy, sid)
+                      if removed:
+                          _put_policy(key_id, policy_name, policy)
+
+                      _send_response(
+                          event, context, "SUCCESS",
+                          data={"StatementSid": sid, "Removed": str(removed)},
+                          physical_resource_id=physical_id
+                      )
+                      return
+
+                  _send_response(event, context, "FAILED", data={}, physical_resource_id=physical_id, reason="Unknown RequestType")
+
+              except Exception as e:
+                  tb = traceback.format_exc()
+                  _send_response(
+                      event, context, "FAILED",
+                      data={"Error": str(e)},
+                      physical_resource_id=physical_id,
+                      reason=tb[:1024]
+                  )
+
+
+
+  KMSUpdate:
+    Condition: CreateKMSUpdate
+    Type: Custom::KMSUpdate
+    Properties:
+      ServiceToken: !GetAtt KMSUpdateFunction.Arn
+      KeyId: !Ref ExistingKmsKeyIdOrArn
+      PrincipalArn: !GetAtt MetadataFinderRole.Arn
+
 
 Outputs:    
   Manifests:
