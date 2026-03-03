@@ -360,7 +360,7 @@ Permissions required:
 
 KMS permissions are *not* required for scenario 1, 2 and 4 jobs, as DELETE operations do not encrypt or decrypt data.
 
-If you specify an `S3 Metadata tables KMS key` during deployment, the new `MetadataFinderRole` will be granted      `kms:Decrypt`, `kms:GenerateDataKey`, and `kms:DescribeKey` on this key. These permissions are removed when the CloudFormation stack is deleted.
+If you specify an `S3 Metadata tables KMS key` during deployment, the new `MetadataFinderRole` will be granted `kms:Decrypt`, `kms:GenerateDataKey` and `kms:DescribeKey` on this key. These permissions will be removed when the CloudFormation stack is deleted.
 
 ## AWS Lambda concurrency reservations
 
@@ -459,4 +459,5 @@ This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) fil
 * Ed Gummett, Senior Storage Specialist Solutions Architect, AWS. [Connect on LinkedIn.](https://www.linkedin.com/in/egummett/)
 * Paul Gargan, Senior Solutions Architect, AWS.
 * Tom Bailey, Senior Technical Account Manager, AWS. [Connect on LinkedIn.](https://www.linkedin.com/in/tom-bailey-1633866/)
-* Karim Omar, Cloud Support Eng, AWS.
+* Karim Omar, Cloud Support Engineer, AWS.
+
