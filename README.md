@@ -360,6 +360,8 @@ Permissions required:
 
 KMS permissions are *not* required for scenario 1, 2 and 4 jobs, as DELETE operations do not encrypt or decrypt data.
 
+If you specify an `S3 Metadata tables KMS key` during deployment, the new `MetadataFinderRole` will be granted      `kms:Decrypt`, `kms:GenerateDataKey`, and `kms:DescribeKey` on this key. These permissions are removed when the CloudFormation stack is deleted.
+
 ## AWS Lambda concurrency reservations
 
 **This tool does not assign [reserved concurrency](https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html)** to the Lambda functions it creates, and may consume all the available [AWS Lambda concurrent execution quota](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html#compute-and-storage). **If you have concerns about this, review the S3 Batch Operations tasks that use Lambda (scenarios 1, 2, 3c, 4 and 5), and [adjust the Lambda functions accordingly](https://docs.aws.amazon.com/lambda/latest/dg/configuration-concurrency.html#configuring-concurrency-reserved) before running the jobs**. We made this design decision because 1/ at the time the functions are created the tool does not know the number of objects (if any) in scope for the relevant scenarios, 2/ we don't know the Lambda concurrent execution quota, or how much it is appropriate to consume, and 3/ when a function has reserved concurrency, no other function can use that concurrency. Any reservation assigned by the tool would have been held until the CloudFormation stack was deleted.
@@ -444,6 +446,7 @@ To clean up, delete the CloudFormation stack. This will delete any CSV manifests
     - Added 'Copy to Bucket' mode
     - Updated GitHub references following the move to https://github.com/aws-solutions-library-samples/
 - 2025-11-27 - Updated to include support for S3 Metadata tables
+- 2026-03-02 - Added support for KMS-encrypted S3 Metadata tables
 
 ## Notices
 
@@ -456,4 +459,4 @@ This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) fil
 * Ed Gummett, Senior Storage Specialist Solutions Architect, AWS. [Connect on LinkedIn.](https://www.linkedin.com/in/egummett/)
 * Paul Gargan, Senior Solutions Architect, AWS.
 * Tom Bailey, Senior Technical Account Manager, AWS. [Connect on LinkedIn.](https://www.linkedin.com/in/tom-bailey-1633866/)
-
+* Karim Omar, Cloud Support Eng, AWS.
