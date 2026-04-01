@@ -11,7 +11,8 @@
   - [Cost](#cost)
 - [Prerequisites](#prerequisites)
 - [Deploying and Running the Guidance](#deploying-and-running-the-guidance)
-- [Rolling back changes at scale](#rolling-back-changes-at-scale)
+  - [Large-scale template (s3-rollback-glue-metadata.yaml)](#large-scale-template-s3-rollback-glue-metadatayaml)
+- [How it works](#how-it-works)
 - [Scenarios covered](#scenarios-covered)
   - [Bucket Rollback mode](#bucket-rollback-mode)
   - [Delete Marker Removal mode](#delete-marker-removal-mode)
@@ -38,7 +39,7 @@
 ## Overview
 If you want to revert undesired changes to a dataset in Amazon S3, as quickly as possible, this tool is for you. It can detect and revert thousands of changes in under 15 minutes, 10 million changes in under an hour, or 100 million changes in under 5 hours. Alternatively, it can recreate a desired point in time into an empty bucket.
 
-The only [Prerequisites](#prerequisites) are that [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) is enabled, and the desired versions still exist. If your bucket, or the prefix in scope, has up to 10 million objects, you can get started in under an hour after the undesired event by [creating a real-time inventory](#creating-a-real-time-inventory-using-the-listobjectversions-api). For buckets with [S3 Metadata live inventory tables](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) enabled and up to 3 billion objects in scope for rollback, you can get started in only 15 minutes. **We strongly advise that you enable S3 Metadata to accelerate and simplify recovery - see [this video](https://www.youtube.com/watch?v=2XR2trZvv7w) for a walkthrough.** If you don't want to enable S3 Metadata, or have even more objects in scope, you can get started in under 48 hours with an [S3 Inventory report](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html).
+The only [Prerequisites](#prerequisites) are that [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) is enabled, and the desired versions still exist. If your bucket, or the prefix in scope, has up to 10 million objects, you can get started in under an hour after the undesired event by [creating a real-time inventory](#creating-a-real-time-inventory-using-the-listobjectversions-api). For buckets with [S3 Metadata live inventory tables](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) enabled, you can get started in only 15 minutes. **We strongly advise that you enable S3 Metadata to accelerate and simplify recovery - see [this video](https://www.youtube.com/watch?v=2XR2trZvv7w) for a walkthrough.** If you don't want to enable S3 Metadata you can get started in under 48 hours with an [S3 Inventory report](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html).
 
 <table>
 <tr>
@@ -73,7 +74,7 @@ The tool will not permanently delete any data. In the default 'Bucket Rollback' 
 
 You are responsible for the cost of the AWS services used while running this Guidance. 
 
-For example, as of 2025-11-17, if you use this tool in 'Bucket Rollback' mode against an entire bucket in the US East (N. Virginia) Region containing 1 billion objects and with S3 Metadata live inventory enabled or an existing Amazon S3 Inventory, to roll back 1 million non-overwrite PUTs, 1 million overwrite PUTs (of objects in Standard or Intelligent-Tiering classes`*`) *and* 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $12**, detailed in the following table: 
+For example, as of 2026-04-01, if you use this tool in 'Bucket Rollback' mode against an entire bucket in the US East (N. Virginia) Region containing 1 billion objects and with S3 Metadata live inventory enabled or an existing Amazon S3 Inventory, to roll back 1 million non-overwrite PUTs, 1 million overwrite PUTs (of objects in Standard or Intelligent-Tiering classes`*`) *and* 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $12**, detailed in the following table: 
 
 | AWS service | Dimensions | Cost [USD] |
 |-------------|------------|------------|
@@ -83,16 +84,16 @@ For example, as of 2025-11-17, if you use this tool in 'Bucket Rollback' mode ag
 | [AWS Lambda](https://aws.amazon.com/lambda/pricing/) | Compute time and requests | $1 |
 | [S3 Metadata](https://aws.amazon.com/s3/pricing/) (if enabled) | Journal table updates | $0.90 |
 
-- `*` Objects in these S3 storage classes are not subject to a per-GB retrieval charge when copied. 
+If using the large-scale template (`s3-rollback-glue-metadata.yaml`) with default settings (40 G.8X workers), add approximately **$2** for the [AWS Glue](https://aws.amazon.com/glue/) Spark job that computes the point-in-time table. See [AWS Glue pricing](https://aws.amazon.com/glue/pricing/).
+
+- `*` Objects in these S3 storage classes are not subject to a per-GB retrieval charge when copied.
 - Additional storage charges for copies are not included in the above estimates.
-- Athena charges can be expected to scale with objects in the inventory. 
-- Following the [simple demo](#simple-demo) costs $1. 
-- In testing, deleting 100 million delete markers incurred $36 in Lambda charges.  Lambda compute time is higher for COPY than DELETE operations, and scales with object size.
+- Athena charges can be expected to scale with objects in the inventory.
+- Following the [simple demo](#simple-demo) costs $1.
+- In testing, deleting 100 million delete markers incurred $36 in Lambda charges. Lambda compute time is higher for COPY than DELETE operations, and scales with object size.
 - 'Copy to Bucket' mode copies every object (that was current at the timestamp) using S3 Batch Operations and Lambda. Cross-region copies will incur cross-region data transfer charges, and the lower throughput may increase Lambda compute time.
 - S3 does not charge for DELETE operations.
 - If the CloudFormation stack is not deleted after rollback is complete, ongoing S3 storage charges will apply for the temporary S3 bucket. See [Cleanup](#cleanup).
-
-
 ## Prerequisites
 
 1. [S3 Versioning](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Versioning.html) must be enabled on your Amazon S3 bucket, and must have been enabled prior to the undesired event.
@@ -102,8 +103,10 @@ For example, as of 2025-11-17, if you use this tool in 'Bucket Rollback' mode ag
 3. A current inventory list of the bucket is required.
     - Ideally, [S3 Metadata live inventory](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) is enabled on your bucket. For buckets with over a million objects, this is the fastest way for the tool to learn the current state of the bucket. [S3 Metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/metadata-tables-overview.html) support has been tested up to 3 billion objects.
         - [Amazon S3 table buckets integration with AWS analytics services](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-aws.html) must be enabled.
+        - The tool automatically detects whether your account and region uses Lake Formation or IAM-based authorization for S3 Tables:
+            - **IAM mode** (S3 Metadata integration configured after approximately March 17, 2026): no Lake Formation administrator access is required.
+            - **LF mode** (S3 Metadata integration configured before approximately March 17, 2026): the IAM principal deploying the CloudFormation stack must be an [AWS Lake Formation data lake administrator](https://docs.aws.amazon.com/lake-formation/latest/dg/getting-started-setup.html#create-data-lake-admin), or must have been granted `SELECT` with grant option on the S3 Metadata table namespace by a Lake Formation administrator.
         - If your S3 Metadata tables use a customer managed KMS key, specify it during deployment using the **S3 Metadata tables KMS key** parameter.
-        - *If you have more than 3B objects in scope, and want to use S3 Metadata with this tool, please contact the [authors](#authors) either directly or via your AWS account team.*
     - If S3 Metadata is not configured on your bucket, the tool will attempt to detect and use an existing [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html).
         - S3 Inventory reports are supported in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format, when including all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). They must not be stored with [KMS encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html). See [Deployment workflow](#deployment-workflow) for additional detail.
     - An inventory list can be provided manually, and will be used in preference of the above. See the section [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api).
@@ -160,7 +163,33 @@ Before reverting changes, you may wish to prevent further changes taking place, 
 
 When you no longer need the manifests and other artifacts created by the tool, see the [Cleaning up](#cleaning-up) section.
 
-## Rolling back changes at scale   
+## Large-scale template (s3-rollback-glue-metadata.yaml)
+
+For buckets with more than 3 billion objects in scope, the standard template's Athena-based computation of the is_latest field may not complete. The large-scale template (`s3-rollback-glue-metadata.yaml`) replaces this step with an [AWS Glue](https://aws.amazon.com/glue/) Spark job, which processes S3 Metadata using multiple provisioned workers. Above 1 billion objects in scope this version of the template will be faster to complete deployment. All downstream Athena queries remain unchanged.
+
+**When to use this template:**
+- Your bucket has more than ~3 billion objects in scope, and S3 Metadata is enabled.
+- You want faster point-in-time table computation at the cost of ~$2 in Glue charges per billion objects.
+
+**Key differences from the standard template:**
+
+| | s3-rollback.yaml | s3-rollback-glue-metadata.yaml |
+|---|---|---|
+| PIT (Point In Time) table computation | Athena SQL | AWS Glue Spark (Glue 5.1, 40 × G.8X workers by default) |
+| Inventory source | S3 Metadata, S3 Inventory, or CSV | S3 Metadata only |
+| Lake Formation admin required | No — auto-detected; LF admin required only for accounts in LF mode (S3 Metadata configured before March 17, 2026) | No — Glue accesses S3 Metadata via the Iceberg REST endpoint directly, bypassing Lake Formation permission grants |
+| Additional cost | — | ~$2 per billion objects in scope, for default worker configuration |
+
+**Deploying the large-scale template:**
+
+Deploy `s3-rollback-glue-metadata.yaml` with the same parameters as the standard template, plus two additional optional parameters:
+
+- **Worker type**: Glue worker size (G.1X, G.2X, G.4X, G.8X, G.12X, G.16X). Default: G.8X.
+- **Number of workers**: Number of Glue workers. Default: 40 (equivalent to ~1,280 vCPU).
+
+All other parameters, outputs, and S3 Batch Operations jobs are identical to the standard template.
+
+## How it works
 
 Users can [see the version history of a single object key in the S3 console](https://docs.aws.amazon.com/AmazonS3/latest/userguide/list-obj-version-enabled-bucket.html), and reverting a single object to an earlier version is as simple as [making a copy of the desired version to the same object key name](https://docs.aws.amazon.com/AmazonS3/latest/userguide/RestoringPreviousVersions.html), or [deleting a delete marker](https://docs.aws.amazon.com/AmazonS3/latest/userguide/ManagingDelMarkers.html). If an undesired new object has been placed (i.e. a ‘non-overwrite PUT’, not an overwrite of an existing object), it can have a delete marker placed on it with a DELETE operation.
 
@@ -201,6 +230,7 @@ The tool requires an inventory of the bucket or prefix in scope. If none is avai
 - If the **Specify CSV inventory** CloudFormation stack parameter has an entry, the tool will read it from the specified S3 location. If it cannot read or process this file, the deployment will fail.
 - If not, the tool will look at the configuration of the selected bucket. If the bucket has an [S3 Metadata live inventory table](https://aws.amazon.com/blogs/aws/amazon-s3-metadata-now-supports-metadata-for-all-your-s3-objects/) configured and in active status, the tool will query the bucket's S3 Metadata tables (using any specified prefix as a filter).
     - [Amazon S3 table buckets integration with AWS analytics services](https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-aws.html) must be enabled.
+    - The tool auto-detects the account and region's Lake Formation authorization mode and handles permission grants automatically. No Lake Formation administrator access is required in IAM mode (S3 Metadata configured after approximately March 17, 2026). In LF mode (configured before that date), the deploying principal must be a Lake Formation data lake administrator or hold grant option on the namespace.
     - If your S3 Metadata tables use a customer managed KMS key, specify it during deployment using the **S3 Metadata tables KMS key** parameter.
 - Otherwise, the tool looks at the bucket's S3 Inventory configuration. It evaluates the available S3 Inventory reports, and chooses the latest one that is in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format and includes all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). If a prefix has been specified in the CloudFormation deployment, the tool will prioritize inventory configurations matching or containing the specified prefix. If no prefix was specified, there must be a valid S3 Inventory configuration containing all objects in the bucket, or the deployment will fail. 
 
@@ -447,6 +477,15 @@ To clean up, delete the CloudFormation stack. This will delete any CSV manifests
     - Updated GitHub references following the move to https://github.com/aws-solutions-library-samples/
 - 2025-11-27 - Updated to include support for S3 Metadata tables
 - 2026-03-02 - Added support for KMS-encrypted S3 Metadata tables
+- 2026-03-26
+    - Added `s3-rollback-glue-metadata.yaml`: large-scale template using AWS Glue Spark for point-in-time table computation, supporting buckets with more than 3 billion objects
+    - Large-scale template does not require Lake Formation administrator permissions, as it accesses S3 Metadata via the Iceberg REST endpoint directly
+    - Documented Lake Formation administrator requirement for the standard template when using S3 Metadata
+    - Added exponential backoff to Athena API calls in `QueryExecutor` (both templates) and `CSVChecker` (`s3-rollback.yaml`), retrying up to 8 times on throttle errors
+- 2026-03-31
+    - Added IAM mode auto-detection to `s3-rollback.yaml` and `s3-rollback-glue-metadata.yaml`: a new `LFPermissionsGranter` Lambda-backed custom resource replaces the static `AWS::LakeFormation::PrincipalPermissions` and `AWS::LakeFormation::Permissions` resources
+    - Both templates now work in accounts and regions using IAM-based authorization for S3 Tables (configured after approximately March 17, 2026) without requiring Lake Formation administrator permissions
+    - Lake Formation grants are still made automatically in LF-mode accounts and regions (configured before that date); the deploying principal must still be an LF administrator or hold grant option in that case
 
 ## Notices
 
