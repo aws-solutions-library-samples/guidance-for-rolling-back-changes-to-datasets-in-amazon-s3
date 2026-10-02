@@ -174,7 +174,7 @@ Each job shows:
 - **Progress** — objects succeeded, failed, and total, updated in real time.
 - **Completion report** — written to the child stack's temporary S3 bucket when the job finishes. The report lists any per-object failures with their error codes.
 
-> **Note:** [S3 Batch Operations allows a maximum of 6 jobs in `Active` status per account at a time](https://docs.aws.amazon.com/AmazonS3/latest/userguide/batch-ops.html). When running the orchestrator against many buckets, jobs beyond that limit will sit in `Ready` status and start automatically as active slots become available. No action is needed — this is expected behaviour.
+> **Note:** When running the orchestrator against many buckets, not every job runs at once. Jobs can wait in `Ready` status and [start automatically when S3 Batch Operations begins running them](https://docs.aws.amazon.com/AmazonS3/latest/userguide/batch-ops-job-status.html); how long they wait depends on the other jobs running in the account and their priority. No action is needed — this is expected behaviour.
 
 If `StartS3BatchOperationsJobs` is `NO` (the default), the jobs are created in `Suspended` state. You start them manually after reviewing the manifests — see [Reviewing and running the S3 Batch Operations jobs](#reviewing-and-running-the-s3-batch-operations-jobs).
 
@@ -319,6 +319,6 @@ The orchestrator uses a [Distributed Map](https://docs.aws.amazon.com/step-funct
 
 - **CloudFormation** request throttling on `CreateStack` / `DescribeStacks` per account and region. Every CloudFormation API call from the orchestrator's Lambdas is wrapped in exponential backoff (up to 8 retries), so a brief throttling burst is absorbed without failing the run.
 - **Athena** concurrent query execution. The default quota is 20 concurrent DML queries per account. Each child stack runs one slow Athena query during its deployment; spreading 50 concurrent children across the staggered start window keeps peak Athena load close to the per-account quota. Athena API calls also use exponential backoff with up to 8 retries, so transient throttling is absorbed without failing the run.
-- **S3 Batch Operations** — a maximum of 6 jobs can be `Active` per account at a time. Concurrency well above that limit is fine — additional jobs queue in `Ready` status and start automatically as active slots free up.
+- **S3 Batch Operations** — not every job runs at once. Launching many child stacks is fine: jobs that are not yet running wait in `Ready` status and start automatically.
 
 To avoid a thundering herd at startup, the CSV parser assigns each row a `StaggerSeconds` value based on its position. Rows are released in batches of 5 every 15 seconds across the first 50 slots, so no more than 5 child stacks enter the `CreateStack` phase in the same 15-second window. The maximum stagger is 135 seconds. The stagger repeats modulo `MaxConcurrency`, so replacement executions launched as earlier children complete are spread the same way.
