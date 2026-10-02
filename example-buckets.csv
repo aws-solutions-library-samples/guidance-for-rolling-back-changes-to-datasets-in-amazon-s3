@@ -1,0 +1,5 @@
+Bucket Name,Prefix,KMS Key
+my-data-bucket,,
+my-reports-bucket,year=2026/,
+my-logs-bucket,app/errors/,
+my-secrets-bucket,,arn:aws:kms:us-east-1:123456789012:key/0123abcd-4567-89ef-abcd-ef0123456789

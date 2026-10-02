@@ -34,8 +34,8 @@ Use it when you need to undo changes in many buckets, without deploying the roll
 
 Use the orchestrator if all of the following are true:
 - You want to roll back multiple buckets in the same AWS account and region.
-- A single [timestamp](readme.md#deploying-and-running-the-guidance) and a single [execution mode](readme.md#scenarios-covered) (`Bucket Rollback` or `Delete Marker Removal`) apply to every bucket in scope.
-- Each bucket satisfies the [prerequisites](readme.md#prerequisites) for `s3-rollback.yaml` (S3 Versioning enabled, inventory available, etc.).
+- A single [timestamp](README.md#deploying-and-running-the-guidance) and a single [execution mode](README.md#scenarios-covered) (`Bucket Rollback` or `Delete Marker Removal`) apply to every bucket in scope.
+- Each bucket satisfies the [prerequisites](README.md#prerequisites) for `s3-rollback.yaml` (S3 Versioning enabled, inventory available, etc.).
 
 If you only have one bucket to recover, deploy [`s3-rollback.yaml`](s3-rollback.yaml) directly. If you need to combine different timestamps or modes, run the orchestrator multiple times with different input CSVs.
 
@@ -54,13 +54,13 @@ The child stacks are standard `s3-rollback.yaml` deployments. Each creates its o
 
 ## Prerequisites
 
-In addition to the [Rollback Tool for Amazon S3 prerequisites](readme.md#prerequisites) for every bucket in scope:
+In addition to the [Rollback Tool for Amazon S3 prerequisites](README.md#prerequisites) for every bucket in scope:
 
 1. **Stage `s3-rollback.yaml` in S3.** Upload the `s3-rollback.yaml` template from this repository to an S3 bucket you control. The orchestrator references it by HTTPS URL (for example, `https://my-templates.s3.us-east-1.amazonaws.com/s3-rollback.yaml`). Make sure the URL is readable by CloudFormation in the account and region where you deploy the orchestrator.
 2. **Results bucket.** Create or identify a single S3 bucket to receive the orchestrator results CSV. It must be in the same region as the orchestrator stack. Each child stack creates its own temporary bucket for its manifests, Athena output, and S3 Batch Operations reports, so only the orchestrator's results CSV is written here.
 3. **Input CSV in S3.** Upload a CSV listing the buckets to process (see [Input CSV format](#input-csv-format)).
-4. **Deploying principal permissions.** The IAM principal deploying the orchestrator stack needs standard CloudFormation and IAM permissions to create the orchestrator resources. In LF-mode accounts, `lakeformation:PutDataLakeSettings` and `lakeformation:GetDataLakeSettings` are also required, for the same reasons as with `s3-rollback.yaml` (see [Prerequisites](readme.md#prerequisites)). The orchestrator's `LambdaExecutionRole` handles all downstream actions and is scoped to the `s3-rollback-*` naming convention.
-5. **Lake Formation.** If any target bucket uses S3 Metadata integration configured before approximately March 17, 2026, the same [Lake Formation prerequisites](readme.md#prerequisites) apply as with `s3-rollback.yaml`. The orchestrator's Lambda role has `lakeformation:PutDataLakeSettings` and `lakeformation:GetDataLakeSettings`, and child stacks perform LF grants as needed.
+4. **Deploying principal permissions.** See [Orchestrator](permissions.md#orchestrator-s3-rollback-orchestratoryaml) in the permissions guide. The orchestrator always creates its own two IAM roles and makes its `LambdaExecutionRole` a Lake Formation administrator, so the deploying principal needs IAM role creation and `lakeformation:GetDataLakeSettings` and `lakeformation:PutDataLakeSettings`. `LambdaExecutionRole` then creates the child stacks, scoped to the `s3-rollback-*` naming convention.
+5. **Lake Formation.** Child stacks make their Lake Formation grants by assuming `LambdaExecutionRole`, so no child role needs to be a Lake Formation administrator.
 
 ## Input CSV format
 
@@ -102,7 +102,7 @@ Upload the CSV to S3 and note the URL. Both `s3://` and `https://` formats are a
 | **Rollback Template S3 URL** (`TemplateS3Url`) | Yes | HTTPS URL of `s3-rollback.yaml` staged in S3. Must end in `.yaml`. |
 | **Results Bucket** (`ResultsBucket`) | Yes | S3 bucket name where the orchestrator writes its results CSV under `results/`. Each child stack creates its own temporary bucket for manifests, Athena output, and Batch Operations reports. |
 | **Rollback Timestamp** (`TimeStamp`) | Yes | Point-in-time in UTC ISO format `yyyy-mm-ddThh:mm:ss`. Applied to every child stack. |
-| **Execution Mode** (`Mode`) | Yes | One of `Bucket Rollback` or `Delete Marker Removal`. Default: `Delete Marker Removal`. `Copy to Bucket` is not supported — see [Limitations](#limitations). See [Scenarios covered](readme.md#scenarios-covered). |
+| **Execution Mode** (`Mode`) | Yes | One of `Bucket Rollback` or `Delete Marker Removal`. Default: `Delete Marker Removal`. `Copy to Bucket` is not supported — see [Limitations](#limitations). See [Scenarios covered](README.md#scenarios-covered). |
 | **Start S3 Batch Operations Jobs** (`StartS3BatchOperationsJobs`) | No | `YES` to start the Batch Operations jobs automatically in each child stack, `NO` (default) to leave them paused for review. |
 | **Create Shared IAM Role** (`CreateSharedIAMRole`) | No | `YES` (default) to create one IAM role shared by all child stacks. `NO` means each child stack creates its own roles. Ignored if `SharedIAMRoleArn` is set. |
 | **Shared IAM Role ARN (existing)** (`SharedIAMRoleArn`) | No | ARN of an existing IAM role for all child stacks to use. Takes precedence over `CreateSharedIAMRole`. |
@@ -110,10 +110,10 @@ Upload the CSV to S3 and note the URL. Both `s3://` and `https://` formats are a
 
 ### Shared IAM role
 
-By default, each child stack creates its own IAM roles. At scale this can approach the IAM role quota. You have two alternatives:
+By default (`CreateSharedIAMRole` = `YES`), the orchestrator creates one role, `<orchestrator-stack>-child-execution-role`, that every child stack uses. It is deleted with the orchestrator stack. The alternatives:
 
-- Set `CreateSharedIAMRole` to `YES` to have the orchestrator create a single role (`<orchestrator-stack>-child-execution-role`) that all child stacks reuse. The role is trusted by `lambda.amazonaws.com` and `batchoperations.s3.amazonaws.com` and has the permissions needed for inventory detection, Athena queries, S3 data-plane operations, and KMS key policy updates. It is deleted when the orchestrator stack is deleted.
-- Set `SharedIAMRoleArn` to the ARN of a role you manage yourself. This role must match the trust policy and permissions shape of the role created by `CreateSharedIAMRole`. Using a pre-existing role is useful when you want to reuse a role across multiple orchestrator runs or manage it outside CloudFormation.
+- Set `CreateSharedIAMRole` to `NO` to have each child stack create its own roles. At a few hundred buckets this approaches the IAM role quota.
+- Set `SharedIAMRoleArn` to a role you create, for example to reuse it across orchestrator runs or manage it outside CloudFormation. [Orchestrator](permissions.md#orchestrator-s3-rollback-orchestratoryaml) in the permissions guide gives its policy.
 
 If both are provided, `SharedIAMRoleArn` wins.
 
@@ -221,11 +221,11 @@ By default, `StartS3BatchOperationsJobs` is `NO` and each child stack leaves its
 
 1. Inspect the results CSV and identify child stacks with status `CREATE_COMPLETE`.
 2. For each child stack, open the CloudFormation stack in the console and review the `Manifests` output and the S3 Batch Operations jobs listed in the stack outputs.
-3. If your buckets use KMS encryption, grant the roles in each child stack the KMS permissions described in [KMS permissions](readme.md#kms-permissions) before starting copy jobs.
-4. Review [AWS Lambda concurrency reservations](readme.md#aws-lambda-concurrency-reservations) if running in a production account. The child stacks do not reserve concurrency by default.
+3. If your buckets use KMS encryption, grant the roles in each child stack the KMS permissions described in [KMS permissions](README.md#kms-permissions) before starting copy jobs.
+4. Review [AWS Lambda concurrency reservations](README.md#aws-lambda-concurrency-reservations) if running in a production account. The child stacks do not reserve concurrency by default.
 5. When you are ready, run the S3 Batch Operations jobs in each child stack.
 
-The [Mode comparison](readme.md#mode-comparison) and per-mode scenario details in the main readme apply to every child stack.
+The [Mode comparison](README.md#mode-comparison) and per-mode scenario details in the main readme apply to every child stack.
 
 ## Status values
 
@@ -275,7 +275,7 @@ Deleting the orchestrator stack cleans up everything it created:
 ## Limitations
 
 - All child stacks share one `TimeStamp`, one `Mode`, and one `StartS3BatchOperationsJobs` value. If you need these to vary per bucket, run the orchestrator multiple times with different input CSVs.
-- The orchestrator references `s3-rollback.yaml` only. It does not deploy [`s3-rollback-glue-metadata.yaml`](readme.md#large-scale-template-s3-rollback-glue-metadatayaml) child stacks. For buckets with more than ~3 billion objects in scope, deploy `s3-rollback-glue-metadata.yaml` directly.
+- The orchestrator references `s3-rollback.yaml` only. It does not deploy [`s3-rollback-glue-metadata.yaml`](README.md#large-scale-template-s3-rollback-glue-metadatayaml) child stacks. For buckets with more than ~3 billion objects in scope, deploy `s3-rollback-glue-metadata.yaml` directly.
 - The **Specify CSV inventory** parameter is not exposed by the orchestrator. Each bucket must have [S3 Metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/metadata-tables-overview.html) or a valid [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html) configured. To use a manually provided CSV inventory, deploy `s3-rollback.yaml` directly for that bucket.
 - Mode `Copy to Bucket` is not supported. Each Copy to Bucket operation needs its own destination bucket, and the orchestrator has no way to vary it per row. To recreate a point-in-time into a separate bucket, deploy `s3-rollback.yaml` directly for each source bucket.
 - Prefixes containing a literal comma are not supported. The orchestrator always splits the prefix field on commas, so a prefix like `data,backup/` would be treated as two separate prefixes (`data` and `backup/`) regardless of CSV quoting.

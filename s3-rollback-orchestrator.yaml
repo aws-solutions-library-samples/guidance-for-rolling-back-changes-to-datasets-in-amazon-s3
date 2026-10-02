@@ -87,6 +87,7 @@ Parameters:
 
   SNSEmailList:
     Type: String
+    Default: ""
     AllowedPattern: '^$|^\s*[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}(\s*,\s*[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})*\s*$'
     ConstraintDescription: 'Must be empty or a comma-separated list of valid email addresses, such as admin@example.com,security@example.com.'
 
@@ -177,12 +178,22 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # S3 - read input CSV, check bucket existence, write results;
-              # CFN also creates/deletes the child stack's AthenaResultsBucket
+              # Resource "*": CsvParserFunction reads the input CSV (S3CsvUrl) and CloudFormation
+              # reads the child template (TemplateS3Url) as this role. Both are URLs, and S3CsvUrl
+              # may be s3://, virtual-hosted https:// or path-style https://, which CloudFormation
+              # intrinsic functions cannot reliably parse into a bucket ARN.
+              # StackManagerFunction calls head_bucket (s3:ListBucket) on each bucket in the
+              # input CSV, which is only known at run time.
               - Effect: Allow
                 Action:
                   - "s3:GetObject"
-                  - "s3:HeadBucket"
+                  - "s3:ListBucket"
+                Resource: "*"
+              # S3 - CFN creates/deletes each child stack's AthenaResultsBucket. CFN names it
+              # <child stack name, truncated to 30 chars>-athenaresultsbucket-<random>, and child
+              # stacks are named s3-rollback-*.
+              - Effect: Allow
+                Action:
                   - "s3:CreateBucket"
                   - "s3:DeleteBucket"
                   - "s3:PutBucketPublicAccessBlock"
@@ -193,7 +204,8 @@ Resources:
                   - "s3:DeleteBucketPolicy"
                   - "s3:PutBucketTagging"
                   - "s3:GetBucketTagging"
-                Resource: "*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::s3-rollback-*-athenaresultsbucket-*"
               - Effect: Allow
                 Action:
                   - "s3:PutObject"
@@ -221,6 +233,7 @@ Resources:
                   - "cloudformation:DescribeStackEvents"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/s3-rollback-*/*"
+              # Resource "*": cloudformation:ListStacks has no resource-level scoping.
               - Effect: Allow
                 Action:
                   - "cloudformation:ListStacks"
@@ -247,6 +260,23 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/s3-rollback-*"
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-child-execution-role"
+                  - !If [HasExistingSharedRole, !Ref SharedIAMRoleArn, !Ref "AWS::NoValue"]
+              # CloudWatch Logs - CFN creates each child Lambda's log group
+              # (/aws/lambda/s3-rollback/<child-stack>/<function>). Groups are retained on delete.
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:TagResource"
+                  - "logs:ListTagsForResource"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/s3-rollback/s3-rollback-*"
+              # Resource "*": the AWS::Logs::LogGroup handler calls logs:DescribeLogGroups on create
+              # and read, and DescribeLogGroups has no resource types in the Service Authorization
+              # Reference, so a log-group ARN never matches it.
+              - Effect: Allow
+                Action:
+                  - "logs:DescribeLogGroups"
+                Resource: "*"
               # Glue - CFN creates databases/tables in child stacks
               - Effect: Allow
                 Action:
@@ -265,25 +295,34 @@ Resources:
                   - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/s3_rollback_*"
                   - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/s3_rollback_*/*"
                   - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:userDefinedFunction/s3_rollback_*/*"
-              # Glue - GetDatabase on all databases needed for LF grant validation
-              # when LFPermissionsGranter runs as this role (LFAdminRoleArn path).
-              # LF checks Glue IAM permissions even for LF admins when granting on
-              # S3 Tables catalog namespaces, which use non-s3_rollback_* names.
+              # Glue - read access on the S3 Metadata namespaces (b_<bucket>) in s3tablescatalog/aws-s3,
+              # for LF grants made when child LFPermissionsGranters assume this role (LFAdminRoleArn
+              # path). LF checks the grantor's Glue IAM permissions even for LF admins.
               - Effect: Allow
                 Action:
+                  - "glue:GetCatalog"
                   - "glue:GetDatabase"
                   - "glue:GetTable"
-                  - "glue:GetCatalog"
-                Resource: "*"
-              # S3 Tables - needed when LFPermissionsGranter runs as this role
-              # (LFAdminRoleArn path) to make LF grants on S3 Tables catalog namespaces.
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog/aws-s3"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/s3tablescatalog/aws-s3/b_*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/s3tablescatalog/aws-s3/b_*/*"
+              # S3 Tables - the S3 Metadata table bucket (aws-s3), for LF grants on its namespaces
+              # when child LFPermissionsGranters assume this role (LFAdminRoleArn path).
               - Effect: Allow
                 Action:
                   - "s3tables:GetTableBucket"
                   - "s3tables:GetNamespace"
+                  - "s3tables:GetTable"
                   - "s3tables:ListNamespaces"
                   - "s3tables:ListTables"
-                Resource: "*"              # Athena - CFN creates workgroups and named queries; child Lambdas run queries
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3"
+                  - !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3/table/*"
+              # Athena - CFN creates named queries in child stacks, in either this stack's pooled
+              # WorkGroups (${AWS::StackName}-wg-*) or a child-owned WorkGroup (s3_rollback_wg_*).
               - Effect: Allow
                 Action:
                   - "athena:CreateWorkGroup"
@@ -297,7 +336,9 @@ Resources:
                   - "athena:StartQueryExecution"
                   - "athena:GetQueryExecution"
                   - "athena:GetQueryResults"
-                Resource: "*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AWS::StackName}-wg-*"
+                  - !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/s3_rollback_wg_*"
               # Lambda - CFN creates/deletes functions in child stacks
               - Effect: Allow
                 Action:
@@ -314,7 +355,8 @@ Resources:
                   - "lambda:UntagResource"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:s3-rollback-*"
-              # LakeFormation - child stacks set admins and grant permissions
+              # Resource "*": Lake Formation actions have no resource-level scoping.
+              # Child stacks set admins and grant permissions as this role.
               - Effect: Allow
                 Action:
                   - "lakeformation:GetDataLakeSettings"
@@ -323,16 +365,22 @@ Resources:
                   - "lakeformation:GrantPermissions"
                   - "lakeformation:RevokePermissions"
                 Resource: "*"
-              # CloudWatch Logs - Lambda execution logging
+              # CloudWatch Logs - each of this stack's Lambdas writes to its own log group
               - Effect: Allow
                 Action:
-                  - "logs:CreateLogGroup"
                   - "logs:CreateLogStream"
                   - "logs:PutLogEvents"
-                  - "logs:TagResource"
-                  - "logs:TagLogGroup"
                 Resource:
-                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*:*"
+                  - !If [HasSNSEmailList, !GetAtt SNSSubscriptionFunctionLogGroup.Arn, !Ref "AWS::NoValue"]
+                  - !GetAtt CsvParserFunctionLogGroup.Arn
+                  - !GetAtt StackManagerFunctionLogGroup.Arn
+                  - !GetAtt ResultsWriterFunctionLogGroup.Arn
+                  - !GetAtt CleanupStopExecutionsFunctionLogGroup.Arn
+                  - !GetAtt CleanupFindStacksFunctionLogGroup.Arn
+                  - !GetAtt CleanupDeleteOneFunctionLogGroup.Arn
+                  - !GetAtt CleanupPollOneFunctionLogGroup.Arn
+                  - !GetAtt CleanupTriggerFunctionLogGroup.Arn
+                  - !GetAtt AutoStartFunctionLogGroup.Arn
               # Step Functions - auto-start triggers the orchestrator;
               # cleanup-trigger starts the cleanup state machine on stack deletion.
               - Effect: Allow
@@ -341,19 +389,29 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-orchestrator"
                   - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-cleanup"
-              # Step Functions - cleanup-trigger polls and may abort the cleanup execution.
+              # Step Functions - cleanup-trigger polls and may abort the cleanup execution;
+              # CleanupStopExecutionsFunction stops running orchestrator executions on stack deletion.
               - Effect: Allow
                 Action:
                   - "states:DescribeExecution"
                   - "states:StopExecution"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${AWS::StackName}-cleanup:*"
-              # SNS - subscribe emails and publish notifications
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:${AWS::StackName}-orchestrator:*"
               - Effect: Allow
                 Action:
-                  - "sns:Subscribe"
-                  - "sns:Publish"
-                Resource: "*"
+                  - "states:ListExecutions"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-orchestrator"
+              # SNS - subscribe emails to and publish on this stack's failure topic
+              - !If
+                - HasSNSEmailList
+                - Effect: Allow
+                  Action:
+                    - "sns:Subscribe"
+                  Resource:
+                    - !Ref FailureNotificationTopic
+                - !Ref "AWS::NoValue"
 
   ChildStackExecutionRole:
     Type: AWS::IAM::Role
@@ -374,22 +432,19 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              # CloudWatch Logs
-              - Effect: Allow
-                Action:
-                  - "logs:CreateLogGroup"
-                Resource:
-                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
+              # CloudWatch Logs - child stacks (named s3-rollback-*) give each Lambda its own
+              # log group under /aws/lambda/s3-rollback/<child-stack>/
               - Effect: Allow
                 Action:
                   - "logs:CreateLogStream"
                   - "logs:PutLogEvents"
                 Resource:
-                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
-              # S3 - data plane operations on target buckets
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/s3-rollback/s3-rollback-*"
+              # Resource "*": target buckets come from the input CSV at run time, so bucket
+              # resources stay "*". s3:GetObjectVersionTagging is required by the
+              # Scenario 3b native copy of tagged versions and by S3BatchOpsCopyFunction.
               - Effect: Allow
                 Action:
-                  - "s3:HeadBucket"
                   - "s3:GetBucketVersioning"
                   - "s3:GetBucketMetadataTableConfiguration"
                   - "s3:GetInventoryConfiguration"
@@ -398,48 +453,69 @@ Resources:
                   - "s3:GetObject"
                   - "s3:GetObjectVersion"
                   - "s3:GetObjectTagging"
+                  - "s3:GetObjectVersionTagging"
                   - "s3:PutObject"
                   - "s3:PutObjectTagging"
                   - "s3:DeleteObject"
                   - "s3:DeleteObjectVersion"
-                  - "s3:HeadObject"
-                  - "s3:CopyObject"
                 Resource: "*"
-              # S3 Batch Operations
+              # Resource "*": S3 Batch Operations CreateJob has no resource-level scoping, and
+              # UpdateJobStatus targets job IDs that only exist at run time.
               - Effect: Allow
                 Action:
                   - "s3:CreateJob"
                   - "s3:UpdateJobStatus"
-                  - "s3:DescribeJob"
                 Resource: "*"
-              # IAM - pass self to S3 Batch Operations
+              # IAM - pass self to S3 Batch Operations. CreateJob evaluates
+              # iam:PassedToService as s3.amazonaws.com.
               - Effect: Allow
                 Action:
                   - "iam:PassRole"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AWS::StackName}-child-execution-role"
-              # Athena - query execution
+                Condition:
+                  StringEquals:
+                    "iam:PassedToService": "s3.amazonaws.com"
+              # Athena - child stacks use the orchestrator's WorkGroup pool
               - Effect: Allow
                 Action:
                   - "athena:GetNamedQuery"
                   - "athena:StartQueryExecution"
                   - "athena:GetQueryExecution"
                   - "athena:GetQueryResults"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AWS::StackName}-wg-*"
+                  - !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/s3_rollback_wg_*"
+              - Effect: Allow
+                Action:
                   - "athena:GetDataCatalog"
-                  - "athena:GetWorkGroup"
-                Resource: "*"
-              # Glue - catalog access for Athena queries
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/s3tablescatalog"
+              # Glue - each child stack's own database
               - Effect: Allow
                 Action:
                   - "glue:GetDatabase"
                   - "glue:GetTable"
                   - "glue:GetTables"
-                  - "glue:GetCatalog"
                   - "glue:GetPartitions"
-                  - "glue:CreateDatabase"
                   - "glue:CreateTable"
-                Resource: "*"
-              # LakeFormation - data access and permissions
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/s3_rollback_db_*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/s3_rollback_db_*/*"
+              # Glue - S3 Metadata namespaces (b_<bucket>) in the S3 Tables catalog
+              - Effect: Allow
+                Action:
+                  - "glue:GetCatalog"
+                  - "glue:GetDatabase"
+                  - "glue:GetTable"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog/s3tablescatalog/aws-s3"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/s3tablescatalog/aws-s3/b_*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/s3tablescatalog/aws-s3/b_*/*"
+              # Resource "*": Lake Formation actions have no resource-level scoping.
               - Effect: Allow
                 Action:
                   - "lakeformation:GetDataLakeSettings"
@@ -461,20 +537,20 @@ Resources:
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3"
                   - !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3/table/*"
-              # STS - get account ID for S3 Batch Operations and assume
-              # orchestrator's LF admin role for LF grants in child stacks.
+              # STS - assume the orchestrator's LF admin role (LFAdminRoleArn) for LF grants
               - Effect: Allow
                 Action:
-                  - "sts:GetCallerIdentity"
                   - "sts:AssumeRole"
-                Resource: "*"
-              # KMS - describe and update key policies when customer-managed keys are used
+                Resource:
+                  - !GetAtt LambdaExecutionRole.Arn
+              # KMS - update key policies of customer managed keys listed in the input CSV
               - Effect: Allow
                 Action:
                   - "kms:DescribeKey"
                   - "kms:GetKeyPolicy"
                   - "kms:PutKeyPolicy"
-                Resource: "*"
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/*"
               # Lambda - S3 Batch Operations invokes rollback functions
               - Effect: Allow
                 Action:
@@ -497,11 +573,18 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # Lambda - the functions the orchestrator and cleanup state machines invoke
               - Effect: Allow
                 Action:
                   - "lambda:InvokeFunction"
                 Resource:
-                  - !Sub "arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+                  - !GetAtt CsvParserFunction.Arn
+                  - !GetAtt StackManagerFunction.Arn
+                  - !GetAtt ResultsWriterFunction.Arn
+                  - !GetAtt CleanupStopExecutionsFunction.Arn
+                  - !GetAtt CleanupFindStacksFunction.Arn
+                  - !GetAtt CleanupDeleteOneFunction.Arn
+                  - !GetAtt CleanupPollOneFunction.Arn
               # Distributed Map support — the state machine launches STANDARD child
               # executions of itself (one per CSV row) so each gets its own 25k
               # history-event budget. DescribeExecution/StopExecution are used by
@@ -535,6 +618,10 @@ Resources:
                   - "s3:ListMultipartUploadParts"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3:::${ResultsBucket}/intermediate/*"
+              # Resource "*": Step Functions vended-log delivery to CloudWatch Logs. The Step
+              # Functions guide requires "*" because CreateLogDelivery, DescribeLogGroups and the
+              # other actions here do not support CloudWatch Logs resource types.
+              # https://docs.aws.amazon.com/step-functions/latest/dg/cw-logs.html
               - Effect: Allow
                 Action:
                   - "logs:CreateLogDelivery"
@@ -545,11 +632,6 @@ Resources:
                   - "logs:PutResourcePolicy"
                   - "logs:DescribeResourcePolicies"
                   - "logs:DescribeLogGroups"
-                Resource: "*"
-              # SNS - publish failure notifications from state machines
-              - Effect: Allow
-                Action:
-                  - "sns:Publish"
                 Resource: "*"
 
   OrchestratorLogGroup:
@@ -572,11 +654,23 @@ Resources:
       TopicName: !Sub "${AWS::StackName}-failure-notifications"
 
   # Custom resource to subscribe comma-separated email list to the SNS topic.
+  SNSSubscriptionFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasSNSEmailList
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/SNSSubscriptionFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   SNSSubscriptionFunction:
     Type: AWS::Lambda::Function
     Condition: HasSNSEmailList
     Properties:
       FunctionName: !Sub "${AWS::StackName}-sns-subscriptions"
+      LoggingConfig:
+        LogGroup: !Ref SNSSubscriptionFunctionLogGroup
       Runtime: python3.12
       Handler: index.handler
       Timeout: 30
@@ -704,10 +798,21 @@ Resources:
       WorkGroupConfiguration:
         EnforceWorkGroupConfiguration: false
 
+  CsvParserFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/CsvParserFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   CsvParserFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-csv-parser"
+      LoggingConfig:
+        LogGroup: !Ref CsvParserFunctionLogGroup
       Runtime: python3.12
       Handler: index.handler
       Timeout: 60
@@ -893,10 +998,21 @@ Resources:
 
               return results
 
+  StackManagerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/StackManagerFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   StackManagerFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-stack-manager"
+      LoggingConfig:
+        LogGroup: !Ref StackManagerFunctionLogGroup
       Runtime: python3.12
       Handler: index.handler
       Timeout: 300
@@ -1182,10 +1298,21 @@ Resources:
               else:
                   raise ValueError(f'Unknown mode: {mode}')
 
+  ResultsWriterFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/ResultsWriterFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   ResultsWriterFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-results-writer"
+      LoggingConfig:
+        LogGroup: !Ref ResultsWriterFunctionLogGroup
       Runtime: python3.12
       Handler: index.handler
       Timeout: 300
@@ -1725,10 +1852,21 @@ Resources:
   # independently with no Lambda timeout ceiling.
   # ---------------------------------------------------------------------------
 
+  CleanupStopExecutionsFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/CleanupStopExecutionsFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   CleanupStopExecutionsFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-cleanup-stop-executions"
+      LoggingConfig:
+        LogGroup: !Ref CleanupStopExecutionsFunctionLogGroup
       Runtime: python3.12
       Handler: index.handler
       Timeout: 60
@@ -1763,10 +1901,21 @@ Resources:
                       print(f"Warning: list_executions failed: {e}")
               return {'StoppedCount': len(stopped)}
 
+  CleanupFindStacksFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/CleanupFindStacksFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   CleanupFindStacksFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-cleanup-find-stacks"
+      LoggingConfig:
+        LogGroup: !Ref CleanupFindStacksFunctionLogGroup
       Runtime: python3.12
       Handler: index.handler
       Timeout: 300
@@ -1833,10 +1982,21 @@ Resources:
               print(f"Found {len(found)} child stacks")
               return [{'StackName': name} for name in found]
 
+  CleanupDeleteOneFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/CleanupDeleteOneFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   CleanupDeleteOneFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-cleanup-delete-one"
+      LoggingConfig:
+        LogGroup: !Ref CleanupDeleteOneFunctionLogGroup
       Runtime: python3.12
       Handler: index.handler
       Timeout: 120
@@ -1880,10 +2040,21 @@ Resources:
                       raise
               return {'StackName': stack_name, 'Status': 'DELETE_IN_PROGRESS'}
 
+  CleanupPollOneFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/CleanupPollOneFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   CleanupPollOneFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-cleanup-poll-one"
+      LoggingConfig:
+        LogGroup: !Ref CleanupPollOneFunctionLogGroup
       Runtime: python3.12
       Handler: index.handler
       Timeout: 120
@@ -1952,10 +2123,21 @@ Resources:
                   result['FailedResources'] = get_failed_resources(stack_name)
               return result
 
+  CleanupTriggerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/CleanupTriggerFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   CleanupTriggerFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-cleanup-trigger"
+      LoggingConfig:
+        LogGroup: !Ref CleanupTriggerFunctionLogGroup
       Runtime: python3.12
       Handler: index.handler
       Timeout: 900
@@ -2288,10 +2470,21 @@ Resources:
             Action: "sns:Publish"
             Resource: !Ref FailureNotificationTopic
 
+  AutoStartFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/AutoStartFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   AutoStartFunction:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${AWS::StackName}-auto-start"
+      LoggingConfig:
+        LogGroup: !Ref AutoStartFunctionLogGroup
       Runtime: python3.12
       Handler: index.handler
       Timeout: 30
@@ -2334,10 +2527,14 @@ Resources:
     # role is available for every child stack's custom resource Lambdas
     # during cleanup. Without this, CFN could delete the shared role in
     # parallel with the trigger, causing child stack DELETE_FAILED.
+    # OrchestratorLFAdmin must also outlive the trigger: child stacks revoke their
+    # LF grants on deletion by assuming LambdaExecutionRole, which needs to still
+    # be a data lake admin at that point.
     DependsOn:
       - CleanupStateMachine
       - OrchestratorStateMachine
       - ChildStackExecutionRole
+      - OrchestratorLFAdmin
     Properties:
       ServiceToken: !GetAtt CleanupTriggerFunction.Arn
       OrchestratorStackId: !Ref AWS::StackId
@@ -2350,6 +2547,7 @@ Resources:
     DependsOn:
       - CleanupStateMachine
       - OrchestratorStateMachine
+      - OrchestratorLFAdmin
     Properties:
       ServiceToken: !GetAtt CleanupTriggerFunction.Arn
       OrchestratorStackId: !Ref AWS::StackId

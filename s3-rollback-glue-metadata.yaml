@@ -96,6 +96,42 @@ Parameters:
     MinValue: 1
     MaxValue: 1000
 
+  # Pre-created IAM roles
+  SharedIAMRoleArn:
+    Type: String
+    Description: >-
+      Optional. ARN of an IAM role you created for the Lambda functions and S3 Batch Operations jobs,
+      trusted by lambda.amazonaws.com and batchoperations.s3.amazonaws.com. When set, this stack creates
+      no IAM roles, and GlueJobRoleArn must also be set. The stack name must start with the prefix the
+      role's policy uses. Leave blank to have the stack create its own roles. Required permissions:
+      https://github.com/aws-solutions-library-samples/guidance-for-rolling-back-changes-to-datasets-in-amazon-s3/blob/main/permissions.md
+    AllowedPattern: '^(arn:(aws|aws-cn|aws-us-gov):iam::\d{12}:role/.+|)$'
+    ConstraintDescription: Must be an IAM role ARN, or blank.
+    Default: ""
+
+  GlueJobRoleArn:
+    Type: String
+    Description: >-
+      Optional. ARN of an IAM role you created for the AWS Glue Spark job, trusted by glue.amazonaws.com.
+      Set this together with SharedIAMRoleArn. Leave blank to have the stack create its own roles.
+      Required permissions:
+      https://github.com/aws-solutions-library-samples/guidance-for-rolling-back-changes-to-datasets-in-amazon-s3/blob/main/permissions.md
+    AllowedPattern: '^(arn:(aws|aws-cn|aws-us-gov):iam::\d{12}:role/.+|)$'
+    ConstraintDescription: Must be an IAM role ARN, or blank.
+    Default: ""
+
+  LFAdminRoleArn:
+    Type: String
+    Description: >-
+      Optional. ARN of an IAM role that is a Lake Formation data lake administrator in this Region.
+      The stack assumes it to make its Lake Formation grants, so neither SharedIAMRoleArn nor a
+      stack-created role needs to be a data lake administrator. Only used when the Data Catalog is in
+      Lake Formation mode. Required permissions:
+      https://github.com/aws-solutions-library-samples/guidance-for-rolling-back-changes-to-datasets-in-amazon-s3/blob/main/permissions.md
+    AllowedPattern: '^(arn:(aws|aws-cn|aws-us-gov):iam::\d{12}:role/.+|)$'
+    ConstraintDescription: Must be an IAM role ARN, or blank.
+    Default: ""
+
 
 Metadata:
   AWS::CloudFormation::Interface:
@@ -120,7 +156,19 @@ Metadata:
         Parameters:
           - GlueWorkerType
           - GlueWorkerCount
+      - Label:
+          default: "Advanced: pre-created IAM roles"
+        Parameters:
+          - SharedIAMRoleArn
+          - GlueJobRoleArn
+          - LFAdminRoleArn
     ParameterLabels:
+      SharedIAMRoleArn:
+        default: Shared IAM role ARN (Lambda and S3 Batch Operations)
+      GlueJobRoleArn:
+        default: Glue job IAM role ARN
+      LFAdminRoleArn:
+        default: Lake Formation admin role ARN
       BucketName:
         default: Bucket
       ExistingKmsKeyIdOrArn:
@@ -173,7 +221,35 @@ Conditions:
 
   CreateKMSUpdate: !Not [!Equals [!Ref ExistingKmsKeyIdOrArn, ""]]
 
+  # Pre-created roles. The CheckSharedRoles* rules guarantee SharedIAMRoleArn and
+  # GlueJobRoleArn are either both set or both blank, so one condition covers both.
+  UseSharedIAMRole: !Not [!Equals [!Ref SharedIAMRoleArn, ""]]
+  CreateOwnRoles: !Not [!Condition UseSharedIAMRole]
+  HasLFAdminRole: !Not [!Equals [!Ref LFAdminRoleArn, ""]]
+  # Elevate the per-stack LFPermissionsGranterRole to LF admin only when the stack
+  # creates its own roles and no LF admin role was supplied.
+  CreateOwnLFAdmin: !And [!Condition CreateOwnRoles, !Not [!Condition HasLFAdminRole]]
+  CreateOwnS3BatchOpsDeleteFunctionRole: !And [!Condition WantRollbackOrDMRemoval, !Condition CreateOwnRoles]
+  CreateOwnS3BatchOpsCopyFunctionRole: !And [!Condition WantRollbackOrCopy, !Condition CreateOwnRoles]
+  CreateOwnKMSUpdateFunctionRole: !And [!Condition CreateKMSUpdate, !Condition CreateOwnRoles]
+
 Rules:
+  CheckSharedRolesGlueJobRoleArn:
+    RuleCondition: !Not [!Equals [!Ref SharedIAMRoleArn, ""]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref GlueJobRoleArn, ""]]
+        AssertDescription: >-
+          GlueJobRoleArn is missing. SharedIAMRoleArn is set, so GlueJobRoleArn must also be set
+          (or leave both blank to have the stack create its own roles).
+
+  CheckSharedRolesSharedIAMRoleArn:
+    RuleCondition: !Not [!Equals [!Ref GlueJobRoleArn, ""]]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref SharedIAMRoleArn, ""]]
+        AssertDescription: >-
+          SharedIAMRoleArn is missing. GlueJobRoleArn is set, so SharedIAMRoleArn must also be set
+          (or leave both blank to have the stack create its own roles).
+
   CheckForDestinationBucket:
     RuleCondition: !Equals
       - !Ref ExecutionMode
@@ -197,7 +273,9 @@ Resources:
       MemorySize: 1024
       Timeout: 900
       Handler: "index.handler"
-      Role: !GetAtt BucketCleanerRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt BucketCleanerRole.Arn]
+      LoggingConfig:
+        LogGroup: !Ref BucketCleanerLogGroup
       Code:
         ZipFile: |
           import cfnresponse
@@ -222,8 +300,18 @@ Resources:
                 count += len(response.get("Deleted", []))
             cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Status": f"Deleted {count}/{total} keys."})
 
+  BucketCleanerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/BucketCleaner"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   BucketCleanerRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -238,11 +326,8 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: "logs:CreateLogGroup"
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
-              - Effect: Allow
                 Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                Resource: !GetAtt BucketCleanerLogGroup.Arn
               - Effect: Allow
                 Action: ["s3:ListBucket", "s3:DeleteObject"]
                 Resource:
@@ -256,7 +341,9 @@ Resources:
       MemorySize: 128
       Timeout: 60
       Handler: "index.handler"
-      Role: !GetAtt CheckVersioningRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt CheckVersioningRole.Arn]
+      LoggingConfig:
+        LogGroup: !Ref CheckVersioningLogGroup
       Code:
         ZipFile: |
           import cfnresponse
@@ -285,8 +372,18 @@ Resources:
                 reason = f"Error checking versioning: {error.response['Error']['Message']}"
               cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
 
+  CheckVersioningLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/CheckVersioning"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   CheckVersioningRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -301,11 +398,8 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: "logs:CreateLogGroup"
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
-              - Effect: Allow
                 Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                Resource: !GetAtt CheckVersioningLogGroup.Arn
               - Effect: Allow
                 Action: "s3:GetBucketVersioning"
                 Resource:
@@ -325,6 +419,7 @@ Resources:
 
   LFPermissionsGranterRole:
     Type: AWS::IAM::Role
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -338,18 +433,139 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # Resource "*": Lake Formation actions do not support resource-level permissions.
               - Effect: Allow
                 Action:
                   - lakeformation:GetDataLakeSettings
+                  - lakeformation:PutDataLakeSettings
+                  - lakeformation:GetDataAccess
                   - lakeformation:GrantPermissions
                   - lakeformation:RevokePermissions
                 Resource: "*"
+              # A Lake Formation grantor needs Glue read access on the database it grants on.
               - Effect: Allow
                 Action:
-                  - logs:CreateLogGroup
+                  - glue:GetCatalog
+                  - glue:GetDatabase
+                  - glue:GetTable
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*"
+              - !If
+                - HasLFAdminRole
+                - Effect: Allow
+                  Action: sts:AssumeRole
+                  Resource: !Ref LFAdminRoleArn
+                - !Ref AWS::NoValue
+              - Effect: Allow
+                Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                Resource:
+                  - !GetAtt LFPermissionsGranterLogGroup.Arn
+                  - !If [CreateOwnLFAdmin, !GetAtt LFAdminGranterFunctionLogGroup.Arn, !Ref "AWS::NoValue"]
+
+  # LFAdminGranterFunction makes the per-stack LFPermissionsGranterRole a data lake
+  # admin for the life of the stack, so it can grant CREATE_TABLE on the stack database
+  # when the account catalog is in Lake Formation mode. It retries PutDataLakeSettings
+  # on ConcurrentModificationException because parallel stacks modify the same settings.
+  LFAdminGranterFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateOwnLFAdmin
+    Properties:
+      Runtime: python3.13
+      MemorySize: 128
+      Timeout: 120
+      Handler: index.handler
+      Role: !GetAtt LFPermissionsGranterRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref LFAdminGranterFunctionLogGroup
+      Code:
+        ZipFile: |
+          import time
+          import random
+          import boto3
+          import cfnresponse
+
+          lf = boto3.client("lakeformation")
+
+          def handler(event, context):
+              principal_arn = event["ResourceProperties"]["PrincipalArn"]
+              request_type  = event["RequestType"]
+              try:
+                  if request_type == "Create":
+                      _append_admin(principal_arn)
+                  elif request_type == "Delete":
+                      _remove_admin(principal_arn)
+                  # Update: no-op (principal ARN is immutable)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {"PrincipalArn": principal_arn},
+                                   physicalResourceId=principal_arn)
+              except Exception as exc:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                                   reason=str(exc))
+
+          def _put_with_retry(new_settings, max_attempts=10):
+              """Call PutDataLakeSettings, retrying on ConcurrentModificationException."""
+              for attempt in range(max_attempts):
+                  try:
+                      lf.put_data_lake_settings(DataLakeSettings=new_settings)
+                      return
+                  except lf.exceptions.ConcurrentModificationException:
+                      if attempt == max_attempts - 1:
+                          raise
+                      # Exponential backoff with jitter: 1-2s, 2-4s, 4-8s ...
+                      sleep = (2 ** attempt) + random.uniform(0, 1)
+                      print(f"ConcurrentModificationException on attempt {attempt+1}, "
+                            f"retrying in {sleep:.1f}s ...")
+                      time.sleep(sleep)
+
+          def _append_admin(principal_arn):
+              current = lf.get_data_lake_settings()["DataLakeSettings"]
+              admins  = current.get("DataLakeAdmins", [])
+              if any(a["DataLakePrincipalIdentifier"] == principal_arn for a in admins):
+                  print(f"Principal {principal_arn} is already an LF admin, skipping.")
+                  return
+              admins.append({"DataLakePrincipalIdentifier": principal_arn})
+              current["DataLakeAdmins"] = admins
+              _put_with_retry(current)
+              print(f"Added {principal_arn} as LF admin.")
+
+          def _remove_admin(principal_arn):
+              current = lf.get_data_lake_settings()["DataLakeSettings"]
+              admins  = [a for a in current.get("DataLakeAdmins", [])
+                         if a["DataLakePrincipalIdentifier"] != principal_arn]
+              current["DataLakeAdmins"] = admins
+              _put_with_retry(current)
+              print(f"Removed {principal_arn} from LF admins.")
+
+  LFAdminGranterFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateOwnLFAdmin
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/LFAdminGranterFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
+  LFPermissionsGranterAdmin:
+    Type: Custom::LFAdminGranter
+    Condition: CreateOwnLFAdmin
+    Properties:
+      ServiceTimeout: 120
+      ServiceToken: !GetAtt LFAdminGranterFunction.Arn
+      PrincipalArn: !GetAtt LFPermissionsGranterRole.Arn
+
+  LFPermissionsGranterLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/LFPermissionsGranter"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
 
   LFPermissionsGranter:
     Type: AWS::Lambda::Function
@@ -358,14 +574,36 @@ Resources:
       MemorySize: 128
       Timeout: 60
       Handler: index.handler
-      Role: !GetAtt LFPermissionsGranterRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt LFPermissionsGranterRole.Arn]
+      LoggingConfig:
+        LogGroup: !Ref LFPermissionsGranterLogGroup
       Code:
         ZipFile: |
           import json
+          import os
           import boto3
+          import botocore.exceptions
           import cfnresponse
 
+          PERMISSIONS_URL = ("https://github.com/aws-solutions-library-samples/"
+              "guidance-for-rolling-back-changes-to-datasets-in-amazon-s3/blob/main/permissions.md")
+
           lf = boto3.client("lakeformation")
+
+          def get_lf_client(props):
+              """Return an LF client. If LFAdminRoleArn is provided, assume that role."""
+              lf_admin_role = props.get("LFAdminRoleArn", "")
+              if lf_admin_role:
+                  creds = boto3.client("sts").assume_role(
+                      RoleArn=lf_admin_role,
+                      RoleSessionName="LFPermissionsGranter"
+                  )["Credentials"]
+                  return boto3.client("lakeformation",
+                      aws_access_key_id=creds["AccessKeyId"],
+                      aws_secret_access_key=creds["SecretAccessKey"],
+                      aws_session_token=creds["SessionToken"]
+                  )
+              return lf
 
           def handler(event, context):
               request_type = event["RequestType"]
@@ -376,7 +614,8 @@ Resources:
                   elif request_type == "Delete":
                       handle_delete(event, context)
                   else:
-                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {},
+                                       physicalResourceId=event.get("PhysicalResourceId"))
               except Exception as e:
                   cfnresponse.send(event, context, cfnresponse.FAILED, {}, reason=str(e))
 
@@ -390,75 +629,119 @@ Resources:
                   return "IAM_Mode"
               return "LF_Mode"
 
-          def handle_create(event, context, props):
-              settings = lf.get_data_lake_settings(CatalogId=props["DatabaseCatalogId"])
-              mode = detect_mode(settings["DataLakeSettings"])
+          def is_shared_mode(props):
+              return props.get("SharedRoleMode", "NO") == "YES"
+
+          def plan_grants(props, account_mode):
+              # Account catalog in IAM mode needs no grants. In LF mode the query role
+              # needs CREATE_TABLE on the stack database, plus SELECT on the S3 Metadata
+              # namespace only when a NameSpace property is passed.
               grants = []
-              if mode == "LF_Mode":
-                  lf.grant_permissions(
-                      CatalogId=props["DatabaseCatalogId"],
-                      Principal={"DataLakePrincipalIdentifier": props["PrincipalArn"]},
-                      Resource={"Database": {
-                          "CatalogId": props["DatabaseCatalogId"],
-                          "Name": props["DatabaseName"]
-                      }},
-                      Permissions=["CREATE_TABLE"],
-                      PermissionsWithGrantOption=[]
-                  )
+              if account_mode != "LF_Mode":
+                  return grants
+              grants.append({
+                  "type": "database",
+                  "catalogId": props["DatabaseCatalogId"],
+                  "databaseName": props["DatabaseName"],
+                  "principalArn": props["PrincipalArn"],
+                  "permissions": ["CREATE_TABLE"]
+              })
+              namespace = props.get("NameSpace", "default")
+              if namespace != "default":
                   grants.append({
-                      "type": "database",
-                      "catalogId": props["DatabaseCatalogId"],
-                      "databaseName": props["DatabaseName"],
+                      "type": "tableWildcard",
+                      "catalogId": f"{props['DatabaseCatalogId']}:s3tablescatalog/aws-s3",
+                      "databaseName": namespace,
                       "principalArn": props["PrincipalArn"],
-                      "permissions": ["CREATE_TABLE"]
+                      "permissions": ["SELECT"]
                   })
-                  namespace = props.get("NameSpace", "default")
-                  if namespace != "default":
-                      ns_catalog_id = f"{props['DatabaseCatalogId']}:s3tablescatalog/aws-s3"
-                      lf.grant_permissions(
-                          CatalogId=props["DatabaseCatalogId"],
-                          Principal={"DataLakePrincipalIdentifier": props["PrincipalArn"]},
-                          Resource={"Table": {
-                              "CatalogId": ns_catalog_id,
-                              "DatabaseName": namespace,
-                              "TableWildcard": {}
-                          }},
-                          Permissions=["SELECT"],
+              return grants
+
+          def glue_resource_arns(props, grants):
+              region = os.environ.get("AWS_REGION", "")
+              partition = "aws-cn" if region.startswith("cn-") else "aws-us-gov" if region.startswith("us-gov-") else "aws"
+              prefix = f"arn:{partition}:glue:{region}:{props['DatabaseCatalogId']}"
+              arns = [f"{prefix}:catalog"]
+              for g in grants:
+                  if g["type"] == "database":
+                      arns.append(f"{prefix}:database/{g['databaseName']}")
+                  else:
+                      arns += [f"{prefix}:catalog/s3tablescatalog",
+                               f"{prefix}:catalog/s3tablescatalog/aws-s3",
+                               f"{prefix}:database/s3tablescatalog/aws-s3/{g['databaseName']}",
+                               f"{prefix}:table/s3tablescatalog/aws-s3/{g['databaseName']}/*"]
+              return arns
+
+          def check_shared_role_is_admin(props, settings):
+              # In shared-role mode the stack never makes the customer's role an LF admin,
+              # so fail before any grant with a reason that says what to fix.
+              admins = [a.get("DataLakePrincipalIdentifier") for a in settings.get("DataLakeAdmins", [])]
+              role = props["PrincipalArn"]
+              if role not in admins:
+                  region = os.environ.get("AWS_REGION", "")
+                  raise Exception(
+                      f"{role} is not a Lake Formation data lake administrator in {region}. "
+                      "The Data Catalog is in Lake Formation mode, so SharedIAMRoleArn must be a data lake "
+                      "administrator in this Region, or LFAdminRoleArn must name a role that is one. "
+                      f"See {PERMISSIONS_URL}")
+
+          def handle_create(event, context, props):
+              lf_client = get_lf_client(props)
+              settings = lf_client.get_data_lake_settings(
+                  CatalogId=props["DatabaseCatalogId"])["DataLakeSettings"]
+              grants = plan_grants(props, detect_mode(settings))
+              customer_roles = is_shared_mode(props) or bool(props.get("LFAdminRoleArn"))
+              if grants and is_shared_mode(props) and not props.get("LFAdminRoleArn"):
+                  check_shared_role_is_admin(props, settings)
+              for grant in grants:
+                  try:
+                      lf_client.grant_permissions(
+                          CatalogId=grant["catalogId"].split(":")[0],
+                          Principal={"DataLakePrincipalIdentifier": grant["principalArn"]},
+                          Resource=build_resource(grant),
+                          Permissions=grant["permissions"],
                           PermissionsWithGrantOption=[]
                       )
-                      grants.append({
-                          "type": "tableWildcard",
-                          "catalogId": ns_catalog_id,
-                          "databaseName": namespace,
-                          "principalArn": props["PrincipalArn"],
-                          "permissions": ["SELECT"]
-                      })
+                  except botocore.exceptions.ClientError as e:
+                      if customer_roles and e.response["Error"]["Code"] == "AccessDeniedException":
+                          granter = props.get("LFAdminRoleArn") or props["PrincipalArn"]
+                          raise Exception(
+                              f"{e} The granting role {granter} needs lakeformation:GetDataAccess, and "
+                              "glue:GetCatalog, glue:GetDatabase and glue:GetTable on: "
+                              f"{', '.join(glue_resource_arns(props, grants))}. See {PERMISSIONS_URL}") from e
+                      raise
               physical_id = json.dumps({"grants": grants})
               cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physicalResourceId=physical_id)
 
           def handle_delete(event, context):
-              physical_id = event.get("PhysicalResourceId", "{}")
+              # Deletion never blocks on Lake Formation: every failure is logged and the
+              # delete reports success so the stack can finish deleting.
+              props = event.get("ResourceProperties", {})
               try:
-                  state = json.loads(physical_id)
+                  state = json.loads(event.get("PhysicalResourceId", "{}"))
               except (json.JSONDecodeError, TypeError):
-                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
-                  return
-              for grant in state.get("grants", []):
+                  state = {}
+              grants = state.get("grants", []) if isinstance(state, dict) else []
+              if grants:
                   try:
-                      resource = build_resource(grant)
-                      lf.revoke_permissions(
-                          CatalogId=grant["catalogId"].split(":")[0],
-                          Principal={"DataLakePrincipalIdentifier": grant["principalArn"]},
-                          Resource=resource,
-                          Permissions=grant["permissions"],
-                          PermissionsWithGrantOption=[]
-                      )
-                  except lf.exceptions.InvalidInputException as e:
-                      if "AlreadyRevoked" in str(e) or "not found" in str(e).lower():
-                          pass
-                      else:
-                          raise
-              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      lf_client = get_lf_client(props)
+                  except Exception as e:
+                      print(f"Warning: could not get a Lake Formation client ({e}). "
+                            f"These grants were not revoked: {json.dumps(grants)}")
+                      grants = []
+                  for grant in grants:
+                      try:
+                          lf_client.revoke_permissions(
+                              CatalogId=grant["catalogId"].split(":")[0],
+                              Principal={"DataLakePrincipalIdentifier": grant["principalArn"]},
+                              Resource=build_resource(grant),
+                              Permissions=grant["permissions"],
+                              PermissionsWithGrantOption=[]
+                          )
+                      except Exception as e:
+                          print(f"Warning: could not revoke LF grant {grant}: {e}")
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {},
+                               physicalResourceId=event.get("PhysicalResourceId"))
 
           def build_resource(grant):
               if grant["type"] == "database":
@@ -466,23 +749,25 @@ Resources:
                       "CatalogId": grant["catalogId"],
                       "Name": grant["databaseName"]
                   }}
-              elif grant["type"] == "tableWildcard":
-                  return {"Table": {
-                      "CatalogId": grant["catalogId"],
-                      "DatabaseName": grant["databaseName"],
-                      "TableWildcard": {}
-                  }}
+              return {"Table": {
+                  "CatalogId": grant["catalogId"],
+                  "DatabaseName": grant["databaseName"],
+                  "TableWildcard": {}
+              }}
 
   ExecuteLFPermissionsGranter:
     Type: Custom::LFPermissionsGranter
-    DependsOn:
-      - GlueDatabase
-      - QueryExecutorRole
     Properties:
       ServiceToken: !GetAtt LFPermissionsGranter.Arn
-      PrincipalArn: !GetAtt QueryExecutorRole.Arn
+      PrincipalArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt QueryExecutorRole.Arn]
       DatabaseCatalogId: !Ref AWS::AccountId
       DatabaseName: !Ref GlueDatabase
+      LFAdminRoleArn: !Ref LFAdminRoleArn
+      SharedRoleMode: !If [UseSharedIAMRole, "YES", "NO"]
+      # Implicit dependency: LFPermissionsGranterRole must be an LF admin before this
+      # resource grants, and must stay one until this resource has revoked on delete.
+      # The value is ignored by the handler.
+      LFAdminReady: !If [CreateOwnLFAdmin, !GetAtt LFPermissionsGranterAdmin.PrincipalArn, "n/a"]
 
   AthenaWorkGroup:
     Type: "AWS::Athena::WorkGroup"
@@ -505,7 +790,9 @@ Resources:
       MemorySize: 1024
       Timeout: 60
       Handler: "index.handler"
-      Role: !GetAtt MetadataFinderRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt MetadataFinderRole.Arn]
+      LoggingConfig:
+        LogGroup: !Ref MetadataFinderLogGroup
       Code:
         ZipFile: |
           import cfnresponse
@@ -596,8 +883,19 @@ Resources:
                 reason = f"Querying Metadata for bucket '{bucket}' failed: {error.response['Error']['Code']} {error.response['Error']['Message']}"
               cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, reason)
 
+  MetadataFinderLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/MetadataFinder"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
+  # sts:GetCallerIdentity needs no IAM permission, so the role does not grant it.
   MetadataFinderRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -612,20 +910,14 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: "logs:CreateLogGroup"
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
-              - Effect: Allow
                 Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                Resource: !GetAtt MetadataFinderLogGroup.Arn
               - Effect: Allow
                 Action: "s3:GetBucketMetadataTableConfiguration"
                 Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}"
               - Effect: Allow
                 Action: "s3tables:GetTableEncryption"
                 Resource: !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3/table/*"
-              - Effect: Allow
-                Action: "sts:GetCallerIdentity"
-                Resource: "*"
         - !If
           - UseKmsUpdateKeyPolicy
           - PolicyName: kms-access
@@ -642,8 +934,12 @@ Resources:
   # Glue - Job role and Spark job for PIT table
   # ============================================================
 
+  # The per-stack Glue job role keeps the AWSGlueServiceRole managed policy, which AWS
+  # maintains as the Glue runtime changes. permissions.md gives a minimal policy for a
+  # customer-supplied GlueJobRoleArn.
   GlueJobRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -680,11 +976,14 @@ Resources:
                   - "s3tables:ListNamespaces"
                 Resource:
                   - !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3"
-                  - !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3/*"
+                  - !Sub "arn:${AWS::Partition}:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/aws-s3/table/*"
         - PolicyName: s3-table-data
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # Resource "*": S3 Tables serves table data through an AWS-managed access
+              # point whose bucket name is not known at deploy time. The condition limits
+              # this to access points owned by this account.
               - Effect: Allow
                 Action: ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"]
                 Resource: "*"
@@ -695,6 +994,7 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+              # Resource "*": lakeformation:GetDataAccess does not support resource-level permissions.
               - Effect: Allow
                 Action: "lakeformation:GetDataAccess"
                 Resource: "*"
@@ -713,7 +1013,7 @@ Resources:
     Type: "AWS::Glue::Job"
     Properties:
       Name: !Sub "${AWS::StackName}-pit-table"
-      Role: !GetAtt GlueJobRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref GlueJobRoleArn, !GetAtt GlueJobRole.Arn]
       GlueVersion: "5.1"
       WorkerType: !Ref GlueWorkerType
       NumberOfWorkers: !Ref GlueWorkerCount
@@ -737,7 +1037,9 @@ Resources:
       MemorySize: 256
       Timeout: 60
       Handler: "index.handler"
-      Role: !GetAtt GlueJobSubmitterRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt GlueJobSubmitterRole.Arn]
+      LoggingConfig:
+        LogGroup: !Ref GlueJobSubmitterLogGroup
       Code:
         ZipFile: |
           import cfnresponse
@@ -760,8 +1062,18 @@ Resources:
             except Exception as e:
               cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, f"Glue job submission failed: {e}")
 
+  GlueJobSubmitterLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/GlueJobSubmitter"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   GlueJobSubmitterRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -776,17 +1088,17 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: "logs:CreateLogGroup"
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
-              - Effect: Allow
                 Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                Resource: !GetAtt GlueJobSubmitterLogGroup.Arn
               - Effect: Allow
                 Action: "glue:StartJobRun"
                 Resource: !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:job/${GlueJob}"
               - Effect: Allow
                 Action: "iam:PassRole"
                 Resource: !GetAtt GlueJobRole.Arn
+                Condition:
+                  StringEquals:
+                    "iam:PassedToService": glue.amazonaws.com
 
   # WaitCondition for Glue job completion (up to 48 hour timeout)
   GlueJobWaitHandle:
@@ -832,7 +1144,9 @@ Resources:
       MemorySize: 128
       Timeout: 30
       Handler: "index.handler"
-      Role: !GetAtt GlueJobSignalerRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt GlueJobSignalerRole.Arn]
+      LoggingConfig:
+        LogGroup: !Ref GlueJobSignalerLogGroup
       Environment:
         Variables:
           WAIT_HANDLE_URL: !Ref GlueJobWaitHandle
@@ -871,8 +1185,18 @@ Resources:
             with urllib.request.urlopen(req) as resp:
               print(f"Signaled WaitCondition: {status} - {resp.status}")
 
+  GlueJobSignalerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/GlueJobSignaler"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   GlueJobSignalerRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -887,11 +1211,8 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: "logs:CreateLogGroup"
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
-              - Effect: Allow
                 Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                Resource: !GetAtt GlueJobSignalerLogGroup.Arn
 
 
   # ============================================================
@@ -905,7 +1226,9 @@ Resources:
       MemorySize: 256
       Timeout: 60
       Handler: "index.handler"
-      Role: !GetAtt SparkScriptUploaderRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt SparkScriptUploaderRole.Arn]
+      LoggingConfig:
+        LogGroup: !Ref SparkScriptUploaderLogGroup
       Code:
         ZipFile: |
           import cfnresponse
@@ -925,8 +1248,18 @@ Resources:
             except Exception as e:
               cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, str(e))
 
+  SparkScriptUploaderLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/SparkScriptUploader"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   SparkScriptUploaderRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -941,14 +1274,11 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: "logs:CreateLogGroup"
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
-              - Effect: Allow
                 Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                Resource: !GetAtt SparkScriptUploaderLogGroup.Arn
               - Effect: Allow
                 Action: "s3:PutObject"
-                Resource: !Sub "${AthenaResultsBucket.Arn}/*"
+                Resource: !Sub "${AthenaResultsBucket.Arn}/scripts/*"
 
   # ============================================================
   # Athena Query Executor (for downstream queries after PIT table)
@@ -961,7 +1291,9 @@ Resources:
       MemorySize: 1024
       Timeout: 900
       Handler: "index.handler"
-      Role: !GetAtt QueryExecutorRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt QueryExecutorRole.Arn]
+      LoggingConfig:
+        LogGroup: !Ref QueryExecutorLogGroup
       Code:
         ZipFile: |
           import cfnresponse
@@ -1028,8 +1360,18 @@ Resources:
             except Exception as e:
               cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False, f"Caught exception: {e}")
 
+  QueryExecutorLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/QueryExecutor"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   QueryExecutorRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -1044,26 +1386,27 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: "logs:CreateLogGroup"
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
-              - Effect: Allow
                 Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                Resource: !GetAtt QueryExecutorLogGroup.Arn
               - Effect: Allow
                 Action: ["athena:GetNamedQuery", "athena:StartQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults"]
                 Resource: !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}"
               - Effect: Allow
                 Action: "athena:GetDataCatalog"
                 Resource: !Sub "arn:${AWS::Partition}:athena:${AWS::Region}:${AWS::AccountId}:datacatalog/s3tablescatalog"
+              # Every query reads and writes tables in the stack database only.
               - Effect: Allow
-                Action: ["glue:CreateDatabase", "glue:CreateTable"]
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                  - glue:CreateTable
                 Resource:
                   - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog"
-                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/*"
-                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/*"
-              - Effect: Allow
-                Action: "glue:Get*"
-                Resource: "*"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}"
+                  - !Sub "arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*"
+              # Resource "*": lakeformation:GetDataAccess does not support resource-level permissions.
               - Effect: Allow
                 Action: "lakeformation:GetDataAccess"
                 Resource: "*"
@@ -1569,7 +1912,9 @@ Resources:
       MemorySize: 1024
       Timeout: 900
       Handler: "index.handler"
-      Role: !GetAtt ManifestMakerRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt ManifestMakerRole.Arn]
+      LoggingConfig:
+        LogGroup: !Ref ManifestMakerLogGroup
       Code:
         ZipFile: |
           import cfnresponse
@@ -1663,8 +2008,18 @@ Resources:
               response = s3.upload_part_copy(Bucket=bucket, Key=key, CopySource=src, PartNumber=part, UploadId=upload_id)
               return {"ETag": response["CopyPartResult"]["ETag"], "PartNumber": part}
 
+  ManifestMakerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/ManifestMaker"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   ManifestMakerRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -1679,11 +2034,8 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: "logs:CreateLogGroup"
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
-              - Effect: Allow
                 Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                Resource: !GetAtt ManifestMakerLogGroup.Arn
               - Effect: Allow
                 Action: ["s3:ListBucket", "s3:GetObject", "s3:PutObject"]
                 Resource:
@@ -1697,7 +2049,9 @@ Resources:
       MemorySize: 1024
       Timeout: 60
       Handler: "index.handler"
-      Role: !GetAtt S3BatchOpsCreatorRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsCreatorRole.Arn]
+      LoggingConfig:
+        LogGroup: !Ref S3BatchOpsCreatorLogGroup
       Code:
         ZipFile: |
           import cfnresponse
@@ -1779,8 +2133,7 @@ Resources:
                   else:
                       kwargs["Operation"] = {"S3PutObjectCopy": {
                           "TargetResource": f"arn:aws:s3:::{destination_bucket}",
-                          "MetadataDirective": "COPY", "StorageClass": storage_class,
-                          "CannedAccessControlList": "bucket-owner-full-control"}}
+                          "MetadataDirective": "COPY", "StorageClass": storage_class}}
                       if kms_key:
                           kwargs["Operation"]["S3PutObjectCopy"]["SSEAwsKmsKeyId"] = kms_key
                           kwargs["Operation"]["S3PutObjectCopy"]["NewObjectMetadata"] = {"SSEAlgorithm": "KMS"}
@@ -1797,8 +2150,18 @@ Resources:
                   cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, False,
                       f"Failed to create S3 Batch Operations Job: {e}")
 
+  S3BatchOpsCreatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/S3BatchOpsCreator"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   S3BatchOpsCreatorRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -1813,11 +2176,8 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: "logs:CreateLogGroup"
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
-              - Effect: Allow
                 Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                Resource: !GetAtt S3BatchOpsCreatorLogGroup.Arn
               - Effect: Allow
                 Action: "s3:GetObject"
                 Resource: !Sub "${AthenaResultsBucket.Arn}/Manifests/*"
@@ -1827,15 +2187,21 @@ Resources:
                 Condition:
                   StringLike:
                     "s3:prefix": "Manifests/*"
+              # Resource "*": s3:CreateJob does not support resource-level permissions, and
+              # the job ARN for s3:UpdateJobStatus is only known after the job is created.
               - Effect: Allow
                 Action: ["s3:CreateJob", "s3:UpdateJobStatus"]
                 Resource: "*"
               - Effect: Allow
                 Action: "iam:PassRole"
                 Resource: !GetAtt S3BatchOpsExecutorRole.Arn
+                Condition:
+                  StringEquals:
+                    "iam:PassedToService": s3.amazonaws.com
 
   S3BatchOpsExecutorRole:
     Type: "AWS::IAM::Role"
+    Condition: CreateOwnRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -1873,7 +2239,9 @@ Resources:
       MemorySize: 256
       Timeout: 900
       Handler: "index.handler"
-      Role: !GetAtt S3BatchOpsDeleteFunctionRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsDeleteFunctionRole.Arn]
+      LoggingConfig:
+        LogGroup: !Ref S3BatchOpsDeleteFunctionLogGroup
       Code:
         ZipFile: |
           import boto3
@@ -1913,8 +2281,18 @@ Resources:
                   results['results'].append(result)
               return results
 
-  S3BatchOpsDeleteFunctionRole:
+  S3BatchOpsDeleteFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
     Condition: WantRollbackOrDMRemoval
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/S3BatchOpsDeleteFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
+  S3BatchOpsDeleteFunctionRole:
+    Condition: CreateOwnS3BatchOpsDeleteFunctionRole
     Type: "AWS::IAM::Role"
     Properties:
       AssumeRolePolicyDocument:
@@ -1933,11 +2311,8 @@ Resources:
                 Action: "s3:DeleteObject*"
                 Resource: !Sub "arn:${AWS::Partition}:s3:::${BucketName}/${Prefix}*"
               - Effect: Allow
-                Action: "logs:CreateLogGroup"
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
-              - Effect: Allow
                 Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                Resource: !GetAtt S3BatchOpsDeleteFunctionLogGroup.Arn
 
   S3BatchOpsCopyFunction:
     Type: "AWS::Lambda::Function"
@@ -1947,7 +2322,9 @@ Resources:
       MemorySize: 2048
       Timeout: 900
       Handler: "index.handler"
-      Role: !GetAtt S3BatchOpsCopyFunctionRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsCopyFunctionRole.Arn]
+      LoggingConfig:
+        LogGroup: !Ref S3BatchOpsCopyFunctionLogGroup
       Code:
         ZipFile: |
           import boto3
@@ -1991,9 +2368,19 @@ Resources:
                   results['results'].append(result)
               return results
 
+  S3BatchOpsCopyFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: WantRollbackOrCopy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/S3BatchOpsCopyFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   S3BatchOpsCopyFunctionRole:
     Type: "AWS::IAM::Role"
-    Condition: WantRollbackOrCopy
+    Condition: CreateOwnS3BatchOpsCopyFunctionRole
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -2014,30 +2401,41 @@ Resources:
                 Action: "s3:PutObject*"
                 Resource: !If [WantCopy, !Sub "arn:${AWS::Partition}:s3:::${DestinationBucket}/${Prefix}*", !Sub "arn:${AWS::Partition}:s3:::${BucketName}/${Prefix}*"]
               - Effect: Allow
-                Action: "logs:CreateLogGroup"
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
-              - Effect: Allow
                 Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+                Resource: !GetAtt S3BatchOpsCopyFunctionLogGroup.Arn
 
 
   # ============================================================
   # KMS Update (for KMS-encrypted S3 Metadata tables)
   # ============================================================
 
+  KMSUpdateFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateKMSUpdate
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub
+        - "/aws/lambda/s3-rollback/${AWS::StackName}/${StackUuid}/KMSUpdateFunction"
+        - StackUuid: !Select [2, !Split ["/", !Ref "AWS::StackId"]]
+
   KMSUpdateFunction:
     Type: AWS::Lambda::Function
     Condition: CreateKMSUpdate
     Properties:
-      FunctionName: !Sub "${AWS::StackName}-KMSUpdate"
-      Runtime: python3.11
+      Runtime: python3.13
       Handler: index.handler
-      Role: !GetAtt KMSUpdateFunctionRole.Arn
+      Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt KMSUpdateFunctionRole.Arn]
+      LoggingConfig:
+        LogGroup: !Ref KMSUpdateFunctionLogGroup
       Timeout: 60
       Code:
         ZipFile: |
           import json, urllib.request, boto3, traceback
+          import botocore.exceptions
           kms = boto3.client("kms")
+          PERMISSIONS_URL = ("https://github.com/aws-solutions-library-samples/"
+              "guidance-for-rolling-back-changes-to-datasets-in-amazon-s3/blob/main/permissions.md")
           def _send(event, context, status, data, pid=None, reason=None):
               body = json.dumps({"Status": status, "Reason": reason or f"See {context.log_stream_name}",
                   "PhysicalResourceId": pid or context.log_stream_name, "StackId": event["StackId"],
@@ -2047,6 +2445,28 @@ Resources:
           def _sid(event):
               raw = f"{event.get('StackId','')}-{event.get('LogicalResourceId','')}"
               return ("AllowPrincipalUseOfKey_" + "".join(c if c.isalnum() else "_" for c in raw))[:200]
+          def _code(e):
+              return e.response.get("Error", {}).get("Code", "") if isinstance(e, botocore.exceptions.ClientError) else ""
+          def _statement(sid, principal_arn):
+              return {"Sid": sid, "Effect": "Allow", "Principal": {"AWS": principal_arn},
+                  "Action": ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"], "Resource": "*"}
+          def _update_policy(rt, key_id, policy_name, sid, principal_arn):
+              policy = json.loads(kms.get_key_policy(KeyId=key_id, PolicyName=policy_name)["Policy"])
+              if "Statement" not in policy: policy["Statement"] = []
+              if not isinstance(policy["Statement"], list): policy["Statement"] = [policy["Statement"]]
+              kept = [s for s in policy["Statement"] if not (isinstance(s, dict) and s.get("Sid") == sid)]
+              if rt == "Delete" and len(kept) == len(policy["Statement"]):
+                  return
+              policy["Statement"] = kept + ([_statement(sid, principal_arn)] if rt != "Delete" else [])
+              kms.put_key_policy(KeyId=key_id, PolicyName=policy_name, Policy=json.dumps(policy))
+          def _caller_can_use_key(key_id):
+              # With DryRun, KMS raises DryRunOperationException when the call would succeed.
+              try:
+                  kms.generate_data_key(KeyId=key_id, KeySpec="AES_256", DryRun=True)
+                  return True
+              except Exception as e:
+                  print(f"GenerateDataKey DryRun on {key_id}: {e}")
+                  return _code(e) == "DryRunOperationException"
           def handler(event, context):
               pid = event.get("PhysicalResourceId") or f"{event['StackId']}/{event['LogicalResourceId']}"
               try:
@@ -2054,31 +2474,39 @@ Resources:
                   key_id, principal_arn = props["KeyId"], props["PrincipalArn"]
                   policy_name = props.get("PolicyName", "default")
                   sid = props.get("StatementSid") or _sid(event)
+                  shared = props.get("SharedRoleMode", "NO") == "YES"
                   rt = event["RequestType"]
-                  resp = kms.get_key_policy(KeyId=key_id, PolicyName=policy_name)
-                  policy = json.loads(resp["Policy"])
-                  if "Statement" not in policy: policy["Statement"] = []
-                  if not isinstance(policy["Statement"], list): policy["Statement"] = [policy["Statement"]]
-                  if rt in ["Create", "Update"]:
-                      policy["Statement"] = [s for s in policy["Statement"] if not (isinstance(s, dict) and s.get("Sid") == sid)]
-                      policy["Statement"].append({"Sid": sid, "Effect": "Allow", "Principal": {"AWS": principal_arn},
-                          "Action": ["kms:Decrypt", "kms:GenerateDataKey", "kms:DescribeKey"], "Resource": "*"})
-                      kms.put_key_policy(KeyId=key_id, PolicyName=policy_name, Policy=json.dumps(policy))
-                      _send(event, context, "SUCCESS", {"StatementSid": sid}, pid)
-                  elif rt == "Delete":
-                      new_stmts = [s for s in policy["Statement"] if not (isinstance(s, dict) and s.get("Sid") == sid)]
-                      if len(new_stmts) != len(policy["Statement"]):
-                          policy["Statement"] = new_stmts
-                          kms.put_key_policy(KeyId=key_id, PolicyName=policy_name, Policy=json.dumps(policy))
-                      _send(event, context, "SUCCESS", {}, pid)
-                  else:
+                  if rt not in ("Create", "Update", "Delete"):
                       _send(event, context, "FAILED", {}, pid, "Unknown RequestType")
+                      return
+                  try:
+                      _update_policy(rt, key_id, policy_name, sid, principal_arn)
+                  except botocore.exceptions.ClientError as e:
+                      if rt == "Delete":
+                          # Deletion never blocks on the key policy.
+                          print(f"Warning: key policy statement {sid} not removed from {key_id}: {e}")
+                          _send(event, context, "SUCCESS", {}, pid)
+                          return
+                      if not (shared and _code(e) == "AccessDeniedException"):
+                          raise
+                      # A customer who manages the key policy themselves need not grant the
+                      # shared role kms:GetKeyPolicy/PutKeyPolicy. Accept if the role can use the key.
+                      if not _caller_can_use_key(key_id):
+                          reason = (f"Cannot update the key policy of {key_id} ({_code(e)}), and the role cannot use the key. "
+                              f"Add this statement to the key policy: {json.dumps(_statement(sid, principal_arn))} "
+                              f"or grant the role kms:GetKeyPolicy and kms:PutKeyPolicy on the key. See {PERMISSIONS_URL}")
+                          _send(event, context, "FAILED", {}, pid, reason)
+                          return
+                      print(f"Key policy of {key_id} not changed: the role can already use the key.")
+                      _send(event, context, "SUCCESS", {"StatementSid": sid, "KeyPolicyChanged": "NO"}, pid)
+                      return
+                  _send(event, context, "SUCCESS", {"StatementSid": sid} if rt != "Delete" else {}, pid)
               except Exception as e:
                   _send(event, context, "FAILED", {"Error": str(e)}, pid, traceback.format_exc()[:1024])
 
   KMSUpdateFunctionRole:
     Type: AWS::IAM::Role
-    Condition: CreateKMSUpdate
+    Condition: CreateOwnKMSUpdateFunctionRole
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -2093,29 +2521,36 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: logs:CreateLogGroup
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*"
-              - Effect: Allow
                 Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
-                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
-        - !If
-          - UseKmsUpdateKeyPolicy
-          - PolicyName: kms
-            PolicyDocument:
-              Version: "2012-10-17"
-              Statement:
-                - Effect: Allow
-                  Action: ["kms:DescribeKey", "kms:GetKeyPolicy", "kms:PutKeyPolicy"]
-                  Resource: !Ref ExistingKmsKeyIdOrArn
-          - !Ref AWS::NoValue
+                Resource: !GetAtt KMSUpdateFunctionLogGroup.Arn
+        - PolicyName: kms
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["kms:DescribeKey", "kms:GetKeyPolicy", "kms:PutKeyPolicy"]
+                Resource: !Ref ExistingKmsKeyIdOrArn
 
+  # Key policy statement for the role that runs MetadataFinder.
   KMSUpdate:
     Condition: CreateKMSUpdate
     Type: Custom::KMSUpdate
     Properties:
       ServiceToken: !GetAtt KMSUpdateFunction.Arn
       KeyId: !Ref ExistingKmsKeyIdOrArn
-      PrincipalArn: !GetAtt MetadataFinderRole.Arn
+      PrincipalArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt MetadataFinderRole.Arn]
+      SharedRoleMode: !If [UseSharedIAMRole, "YES", "NO"]
+
+  # Key policy statement for the Glue job role: the Spark job reads the encrypted
+  # S3 Metadata tables.
+  KMSUpdateGlueJobRole:
+    Condition: CreateKMSUpdate
+    Type: Custom::KMSUpdate
+    Properties:
+      ServiceToken: !GetAtt KMSUpdateFunction.Arn
+      KeyId: !Ref ExistingKmsKeyIdOrArn
+      PrincipalArn: !If [UseSharedIAMRole, !Ref GlueJobRoleArn, !GetAtt GlueJobRole.Arn]
+      SharedRoleMode: !If [UseSharedIAMRole, "YES", "NO"]
 
 
   # ============================================================
@@ -2149,6 +2584,9 @@ Resources:
       ServiceToken: !GetAtt MetadataFinder.Arn
       Bucket: !Ref BucketName
       KmsKeyIdOrArn: !Ref ExistingKmsKeyIdOrArn
+      # Implicit dependency: the key policy grant completes before MetadataFinder
+      # checks the key. The value is ignored by the handler.
+      KMSGranted: !If [CreateKMSUpdate, !GetAtt KMSUpdate.StatementSid, "n/a"]
 
 
   # Step 2: Upload PySpark script to S3
@@ -2374,6 +2812,9 @@ Resources:
       ServiceTimeout: 60
       ServiceToken: !GetAtt GlueJobSubmitter.Arn
       JobName: !Ref GlueJob
+      # Implicit dependency: the Glue job role's key policy grant completes before the
+      # Spark job reads the encrypted tables. The value is ignored by the handler.
+      KMSGlueJobRoleGranted: !If [CreateKMSUpdate, !GetAtt KMSUpdateGlueJobRole.StatementSid, "n/a"]
       JobArguments:
         "--JOB_NAME": !Ref GlueJob
         "--REGION": !Ref "AWS::Region"
@@ -2659,7 +3100,7 @@ Resources:
       ReportPrefix: "Reports/scenario1"
       Description: "Scenario 1 - Add delete markers"
       FunctionArn: !GetAtt S3BatchOpsDeleteFunction.Arn
-      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      S3BatchOpsRoleArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
       StartJob: !Ref StartS3BatchOperationsJobs
 
   ExecuteS3BatchOpsDeleteCreator2:
@@ -2677,7 +3118,7 @@ Resources:
       ReportPrefix: "Reports/scenario2"
       Description: "Scenario 2 - Delete delete markers"
       FunctionArn: !GetAtt S3BatchOpsDeleteFunction.Arn
-      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      S3BatchOpsRoleArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
       StartJob: !Ref StartS3BatchOperationsJobs
 
   ExecuteS3BatchOpsCopyCreator3b:
@@ -2697,7 +3138,7 @@ Resources:
       DestinationBucket: !Ref BucketName
       StorageClass: !Ref StorageClass
       KMSKey: !If [WantKMS, !Ref KMSKey, !Ref "AWS::NoValue"]
-      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      S3BatchOpsRoleArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
       StartJob: !Ref StartS3BatchOperationsJobs
 
   ExecuteS3BatchOpsCopyCreator3c:
@@ -2718,7 +3159,7 @@ Resources:
       FunctionArn: !GetAtt S3BatchOpsCopyFunction.Arn
       StorageClass: !Ref StorageClass
       KMSKey: !If [WantKMS, !Ref KMSKey, !Ref "AWS::NoValue"]
-      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      S3BatchOpsRoleArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
       StartJob: !Ref StartS3BatchOperationsJobs
 
   ExecuteS3BatchOpsDeleteCreator4:
@@ -2736,7 +3177,7 @@ Resources:
       ReportPrefix: "Reports/scenario4"
       Description: "Scenario 4 - Remove latest DMs"
       FunctionArn: !GetAtt S3BatchOpsDeleteFunction.Arn
-      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      S3BatchOpsRoleArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
       StartJob: !Ref StartS3BatchOperationsJobs
 
   ExecuteS3BatchOpsCopyCreator5b:
@@ -2757,7 +3198,7 @@ Resources:
       FunctionArn: !GetAtt S3BatchOpsCopyFunction.Arn
       StorageClass: !Ref StorageClass
       KMSKey: !If [WantKMS, !Ref KMSKey, !Ref "AWS::NoValue"]
-      S3BatchOpsRoleArn: !GetAtt S3BatchOpsExecutorRole.Arn
+      S3BatchOpsRoleArn: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
       StartJob: !Ref StartS3BatchOperationsJobs
 
 
@@ -2801,12 +3242,12 @@ Outputs:
   CopyRole3b:
     Condition: WantRollback
     Description: IAM Role for S3 Batch Operations Copy Job (Scenario 3b)
-    Value: !GetAtt S3BatchOpsExecutorRole.Arn
+    Value: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
 
   CopyRole3c:
     Condition: WantRollback
     Description: IAM Role for S3 Batch Operations Copy Job (Scenario 3c)
-    Value: !GetAtt S3BatchOpsCopyFunctionRole.Arn
+    Value: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsCopyFunctionRole.Arn]
 
   S3BatchOperationsCopy5bJob:
     Condition: WantCopy
@@ -2816,7 +3257,7 @@ Outputs:
   CopyRole5b:
     Condition: WantCopy
     Description: IAM Role for S3 Batch Operations Copy Job (Scenario 5b)
-    Value: !GetAtt S3BatchOpsExecutorRole.Arn
+    Value: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsExecutorRole.Arn]
 
   S3BatchOperationsDelete4Job:
     Condition: WantDMRemoval
