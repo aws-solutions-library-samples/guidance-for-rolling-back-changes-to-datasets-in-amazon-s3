@@ -264,7 +264,7 @@ Placeholders in this section, in addition to [those above](#placeholders):
 | `SHARED_ROLE_ARN` | ARN of the role you pass as `SharedIAMRoleArn` |
 | `RESULTS_BUCKET` | The orchestrator's results bucket |
 
-**Lake Formation.** If Lake Formation manages permissions on the account catalog or on `s3tablescatalog/aws-s3`, make the Lambda role a data lake administrator in the Region before you deploy. Child stacks create their Glue databases and make their Lake Formation grants as this role. Each orchestrator run checks this first: if the role is not an administrator, the run fails before it creates any child stack, and the execution's failure cause names the role and the catalogs. Make the role an administrator, then start the orchestrator again.
+**Lake Formation.** If Lake Formation manages permissions on the account catalog or on `s3tablescatalog/aws-s3`, make the Lambda role a data lake administrator in the Region before you deploy. Child stacks create their Glue databases and make their Lake Formation grants as this role. Each orchestrator run checks this first: if the role is not an administrator, the run fails before it creates any child stack, and the execution's failure cause names the role and the catalogs. Make the role an administrator, then start the orchestrator again. The check applies even if no bucket in the run uses S3 Metadata, because the orchestrator does not know each bucket's inventory source in advance.
 
 Lambda role trust policy. The second statement lets child stacks assume the role for their Lake Formation grants:
 

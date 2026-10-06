@@ -123,7 +123,7 @@ If both are provided, `SharedIAMRoleArn` wins.
 
 To deploy with no stack-created IAM roles at all, for example where a service control policy (SCP) only allows role names that match an approved pattern, create three roles and pass all three ARNs: `SharedIAMRoleArn`, `OrchestratorLambdaRoleArn` and `OrchestratorStepFunctionsRoleArn`. Neither the orchestrator nor any child stack then creates a role, and the orchestrator does not change the Lake Formation administrator list. [Pre-created orchestrator roles](permissions.md#pre-created-orchestrator-roles) in the permissions guide gives the trust and permission policies.
 
-If Lake Formation manages the account catalog or `s3tablescatalog`, make the Lambda role a data lake administrator before you deploy. Each run checks this before it creates any child stack. If the check fails, the execution fails at `ParseCSVFailed` with a cause that names the role; fix it and start the orchestrator again.
+If Lake Formation manages the account catalog or `s3tablescatalog`, make the Lambda role a data lake administrator before you deploy. Each run checks this before it creates any child stack. If the check fails, the execution fails at `ParseCSVFailed` with a cause that names the role; fix it and start the orchestrator again. The check applies even if no bucket in the run uses S3 Metadata, because the orchestrator does not know each bucket's inventory source in advance.
 
 ## Deploying
 
