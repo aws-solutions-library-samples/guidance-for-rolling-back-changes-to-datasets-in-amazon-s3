@@ -546,6 +546,9 @@ To clean up, delete the CloudFormation stack. This will delete any CSV manifests
     - `s3-rollback-glue-metadata.yaml`: accepts `SharedIAMRoleArn` with `GlueJobRoleArn`, and `LFAdminRoleArn`. Works when the account's Glue Data Catalog is in Lake Formation mode.
     - `s3-rollback-orchestrator.yaml`: the shared child role adds `s3:GetObjectVersionTagging`, needed to restore tagged versions in Bucket Rollback mode. A customer `SharedIAMRoleArn` can have any name. Deleting the orchestrator revokes the child stacks' Lake Formation grants. Running executions are stopped on stack deletion. `SNSEmailList` is optional for CLI and SDK deployments.
     - All templates: every role is scoped to the stack's own resources, each Lambda function writes to its own log group under `/aws/lambda/s3-rollback/`, which is kept after stack deletion, and copies no longer set an object ACL.
+- 2026-10-06
+    - `s3-rollback-orchestrator.yaml`: accepts `OrchestratorLambdaRoleArn` and `OrchestratorStepFunctionsRoleArn`. Set with `SharedIAMRoleArn`, the orchestrator and its child stacks create no IAM roles, for organizations whose SCPs restrict role names. The orchestrator does not make a supplied role a Lake Formation administrator; each run checks the role first and fails before creating child stacks if it needs to be one. A failed CSV parse now reports its cause in the execution. See [Organizations that restrict IAM role names](permissions.md#organizations-that-restrict-iam-role-names).
+    - `s3-rollback.yaml`: when the S3 Tables integration with AWS analytics services is not enabled, the stack now fails with a message that says so and links to the AWS documentation, instead of "Database not found".
 
 ## Notices
 

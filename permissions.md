@@ -13,6 +13,8 @@ The tool never reads or writes object ACLs.
   - [Lake Formation](#lake-formation)
   - [Options that need extra statements](#options-that-need-extra-statements)
 - [Orchestrator (`s3-rollback-orchestrator.yaml`)](#orchestrator-s3-rollback-orchestratoryaml)
+  - [Pre-created orchestrator roles](#pre-created-orchestrator-roles)
+- [Organizations that restrict IAM role names](#organizations-that-restrict-iam-role-names)
 - [Large-scale template (`s3-rollback-glue-metadata.yaml`)](#large-scale-template-s3-rollback-glue-metadatayaml)
 - [KMS keys](#kms-keys)
 
@@ -25,7 +27,7 @@ The tool never reads or writes object ACLs.
 | `ACCOUNT_ID` | Your AWS account ID |
 | `BUCKET` | The bucket to roll back or copy from |
 | `NAMESPACE` | The bucket's S3 Metadata namespace, shown as `TableNamespace` by `aws s3api get-bucket-metadata-configuration --bucket BUCKET`. It is normally `b_` followed by the bucket name |
-| `ROLE_NAME` | The name of the shared role you create |
+| `ROLE_NAME` | The name of the shared role you create. If the role has a path, include it without the leading `/`, for example `approved/rollback-shared` |
 | `STACK_PREFIX` | A prefix that every stack name you deploy with this role starts with, for example `s3rb-`. Keep it to 20 characters or fewer: CloudFormation shortens long stack names when it generates bucket, function and role names, and the policy matches on the start of those names. Lowercase only, because S3 bucket names are lowercase |
 
 Templates deployed with a pre-created role must use a stack name that starts with `STACK_PREFIX`.
@@ -238,16 +240,199 @@ Add these to the shared role when you use the option.
 
 ## Orchestrator (`s3-rollback-orchestrator.yaml`)
 
-The orchestrator always creates two roles of its own, `LambdaExecutionRole` and `StepFunctionsExecutionRole`, and makes `LambdaExecutionRole` a Lake Formation administrator. These cannot be supplied. Its deploying principal therefore needs IAM role creation (`iam:CreateRole`, `iam:PutRolePolicy`, `iam:DeleteRole`, `iam:DeleteRolePolicy`, `iam:GetRole`, `iam:PassRole` on `role/ORCH_STACK-*`) and `lakeformation:GetDataLakeSettings` and `lakeformation:PutDataLakeSettings`, in addition to the CloudFormation, Lambda, Step Functions, Athena, SNS and EventBridge permissions for the resources in the template.
+`ORCH_STACK` is the orchestrator's stack name. Child stacks are named `s3-rollback-...`, and CloudFormation creates them as the orchestrator's Lambda role.
 
-Child stacks are named `s3-rollback-...` and created by `LambdaExecutionRole`. For them, the orchestrator either creates one shared role (`CreateSharedIAMRole` = `YES`, the default), lets each child stack create its own roles (`NO`), or uses a role you create (`SharedIAMRoleArn`). A role you create needs the [shared role policy](#pre-created-shared-role), with these values and changes:
+By default the orchestrator creates two roles of its own, `LambdaExecutionRole` and `StepFunctionsExecutionRole`, and makes `LambdaExecutionRole` a Lake Formation administrator. Its deploying principal then needs IAM role creation (`iam:CreateRole`, `iam:PutRolePolicy`, `iam:DeleteRole`, `iam:DeleteRolePolicy`, `iam:GetRole`, `iam:PassRole` on `role/ORCH_STACK-*`) and `lakeformation:GetDataLakeSettings` and `lakeformation:PutDataLakeSettings`, in addition to the CloudFormation, Lambda, Step Functions, Athena, SNS and EventBridge permissions for the resources in the template. You can instead [supply both roles](#pre-created-orchestrator-roles).
+
+For child stacks, the orchestrator either creates one shared role (`CreateSharedIAMRole` = `YES`, the default), lets each child stack create its own roles (`NO`), or uses a role you create (`SharedIAMRoleArn`). A role you create needs the [shared role policy](#pre-created-shared-role), with these values and changes:
 
 - `STACK_PREFIX` is `s3-rollback-`.
 - `BUCKET` and `NAMESPACE` cover every bucket in the input CSV, or use `*` and `b_*`.
 - Add `arn:PARTITION:athena:REGION:ACCOUNT_ID:workgroup/ORCH_STACK-wg-*` to the `Athena` statement. Child stacks use the orchestrator's WorkGroups.
-- Add `sts:AssumeRole` on `arn:PARTITION:iam::ACCOUNT_ID:role/ORCH_STACK-LambdaExecutionRole-*`. Child stacks make their Lake Formation grants by assuming that role, so the shared role does not need to be a Lake Formation administrator.
+- Add `sts:AssumeRole` on the orchestrator's Lambda role: `arn:PARTITION:iam::ACCOUNT_ID:role/ORCH_STACK-LambdaExecutionRole-*` by default, or `ORCH_LAMBDA_ROLE_ARN` if you supply it. Child stacks make their Lake Formation grants by assuming that role, so the shared role does not need to be a Lake Formation administrator.
 
-`ORCH_STACK` is the orchestrator's stack name.
+### Pre-created orchestrator roles
+
+Pass **Orchestrator Lambda role ARN** (`OrchestratorLambdaRoleArn`), **Orchestrator Step Functions role ARN** (`OrchestratorStepFunctionsRoleArn`) and **Shared IAM role ARN** (`SharedIAMRoleArn`) together. The orchestrator stack and every child stack then create no IAM roles, and the orchestrator does not change the Lake Formation administrator list. Setting only one or two of the three fails template validation.
+
+Placeholders in this section, in addition to [those above](#placeholders):
+
+| Placeholder | Value |
+|---|---|
+| `ORCH_LAMBDA_ROLE_ARN` | ARN of the role you pass as `OrchestratorLambdaRoleArn` |
+| `ORCH_SFN_ROLE_ARN` | ARN of the role you pass as `OrchestratorStepFunctionsRoleArn` |
+| `SHARED_ROLE_ARN` | ARN of the role you pass as `SharedIAMRoleArn` |
+| `RESULTS_BUCKET` | The orchestrator's results bucket |
+
+**Lake Formation.** If Lake Formation manages permissions on the account catalog or on `s3tablescatalog/aws-s3`, make the Lambda role a data lake administrator in the Region before you deploy. Child stacks create their Glue databases and make their Lake Formation grants as this role. Each orchestrator run checks this first: if the role is not an administrator, the run fails before it creates any child stack, and the execution's failure cause names the role and the catalogs. Make the role an administrator, then start the orchestrator again.
+
+Lambda role trust policy. The second statement lets child stacks assume the role for their Lake Formation grants:
+
+<!-- policy:orch-lambda-trust -->
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"},
+    {"Effect": "Allow", "Principal": {"AWS": "arn:PARTITION:iam::ACCOUNT_ID:root"}, "Action": "sts:AssumeRole",
+     "Condition": {"ArnLike": {"aws:PrincipalArn": "SHARED_ROLE_ARN"}}}
+  ]
+}
+```
+
+Lambda role permissions policy. Add the `FailureTopic` statement only if you set `SNSEmailList`:
+
+<!-- policy:orch-lambda -->
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid": "ReadInputCsvAndTemplate", "Effect": "Allow", "Action": ["s3:GetObject", "s3:ListBucket"], "Resource": "*"},
+    {"Sid": "ChildResultsBuckets", "Effect": "Allow",
+     "Action": ["s3:CreateBucket", "s3:DeleteBucket", "s3:PutBucketPublicAccessBlock", "s3:PutEncryptionConfiguration",
+                "s3:GetEncryptionConfiguration", "s3:PutBucketPolicy", "s3:GetBucketPolicy", "s3:DeleteBucketPolicy",
+                "s3:PutBucketTagging", "s3:GetBucketTagging"],
+     "Resource": "arn:PARTITION:s3:::s3-rollback-*-athenaresultsbucket-*"},
+    {"Sid": "WriteResults", "Effect": "Allow", "Action": "s3:PutObject",
+     "Resource": "arn:PARTITION:s3:::RESULTS_BUCKET/results/*"},
+    {"Sid": "ReadIntermediateResults", "Effect": "Allow", "Action": "s3:GetObject",
+     "Resource": "arn:PARTITION:s3:::RESULTS_BUCKET/intermediate/*"},
+    {"Sid": "ListResultsBucket", "Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:PARTITION:s3:::RESULTS_BUCKET"},
+    {"Sid": "ChildStacks", "Effect": "Allow",
+     "Action": ["cloudformation:CreateStack", "cloudformation:DescribeStacks", "cloudformation:DeleteStack",
+                "cloudformation:DescribeStackEvents"],
+     "Resource": "arn:PARTITION:cloudformation:REGION:ACCOUNT_ID:stack/s3-rollback-*/*"},
+    {"Sid": "ListStacks", "Effect": "Allow", "Action": "cloudformation:ListStacks", "Resource": "*"},
+    {"Sid": "PassSharedRole", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "SHARED_ROLE_ARN",
+     "Condition": {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}}},
+    {"Sid": "ChildLogGroups", "Effect": "Allow",
+     "Action": ["logs:CreateLogGroup", "logs:TagResource", "logs:ListTagsForResource"],
+     "Resource": "arn:PARTITION:logs:REGION:ACCOUNT_ID:log-group:/aws/lambda/s3-rollback/s3-rollback-*"},
+    {"Sid": "DescribeLogGroups", "Effect": "Allow", "Action": "logs:DescribeLogGroups", "Resource": "*"},
+    {"Sid": "OwnLogs", "Effect": "Allow", "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+     "Resource": "arn:PARTITION:logs:REGION:ACCOUNT_ID:log-group:/aws/lambda/s3-rollback/ORCH_STACK/*"},
+    {"Sid": "ChildGlueDatabases", "Effect": "Allow",
+     "Action": ["glue:CreateDatabase", "glue:DeleteDatabase", "glue:GetDatabase", "glue:CreateTable", "glue:DeleteTable",
+                "glue:GetTable", "glue:GetTables", "glue:UpdateTable", "glue:GetUserDefinedFunctions",
+                "glue:DeleteUserDefinedFunction"],
+     "Resource": ["arn:PARTITION:glue:REGION:ACCOUNT_ID:catalog",
+                  "arn:PARTITION:glue:REGION:ACCOUNT_ID:database/s3_rollback_*",
+                  "arn:PARTITION:glue:REGION:ACCOUNT_ID:table/s3_rollback_*/*",
+                  "arn:PARTITION:glue:REGION:ACCOUNT_ID:userDefinedFunction/s3_rollback_*/*"]},
+    {"Sid": "GlueS3MetadataNamespaces", "Effect": "Allow", "Action": ["glue:GetCatalog", "glue:GetDatabase", "glue:GetTable"],
+     "Resource": ["arn:PARTITION:glue:REGION:ACCOUNT_ID:catalog",
+                  "arn:PARTITION:glue:REGION:ACCOUNT_ID:catalog/s3tablescatalog",
+                  "arn:PARTITION:glue:REGION:ACCOUNT_ID:catalog/s3tablescatalog/aws-s3",
+                  "arn:PARTITION:glue:REGION:ACCOUNT_ID:database/s3tablescatalog/aws-s3/b_*",
+                  "arn:PARTITION:glue:REGION:ACCOUNT_ID:table/s3tablescatalog/aws-s3/b_*/*"]},
+    {"Sid": "S3MetadataTables", "Effect": "Allow",
+     "Action": ["s3tables:GetTableBucket", "s3tables:GetNamespace", "s3tables:GetTable", "s3tables:ListNamespaces",
+                "s3tables:ListTables"],
+     "Resource": ["arn:PARTITION:s3tables:REGION:ACCOUNT_ID:bucket/aws-s3",
+                  "arn:PARTITION:s3tables:REGION:ACCOUNT_ID:bucket/aws-s3/table/*"]},
+    {"Sid": "Athena", "Effect": "Allow",
+     "Action": ["athena:CreateWorkGroup", "athena:DeleteWorkGroup", "athena:UpdateWorkGroup", "athena:GetWorkGroup",
+                "athena:TagResource", "athena:CreateNamedQuery", "athena:DeleteNamedQuery", "athena:GetNamedQuery",
+                "athena:StartQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults"],
+     "Resource": ["arn:PARTITION:athena:REGION:ACCOUNT_ID:workgroup/ORCH_STACK-wg-*",
+                  "arn:PARTITION:athena:REGION:ACCOUNT_ID:workgroup/s3_rollback_wg_*"]},
+    {"Sid": "ChildFunctions", "Effect": "Allow",
+     "Action": ["lambda:CreateFunction", "lambda:DeleteFunction", "lambda:GetFunction", "lambda:GetFunctionConfiguration",
+                "lambda:AddPermission", "lambda:RemovePermission", "lambda:InvokeFunction", "lambda:UpdateFunctionCode",
+                "lambda:UpdateFunctionConfiguration", "lambda:TagResource", "lambda:UntagResource"],
+     "Resource": "arn:PARTITION:lambda:REGION:ACCOUNT_ID:function:s3-rollback-*"},
+    {"Sid": "LakeFormation", "Effect": "Allow",
+     "Action": ["lakeformation:GetDataLakeSettings", "lakeformation:GetDataAccess",
+                "lakeformation:GrantPermissions", "lakeformation:RevokePermissions"],
+     "Resource": "*"},
+    {"Sid": "StartStateMachines", "Effect": "Allow", "Action": "states:StartExecution",
+     "Resource": ["arn:PARTITION:states:REGION:ACCOUNT_ID:stateMachine:ORCH_STACK-orchestrator",
+                  "arn:PARTITION:states:REGION:ACCOUNT_ID:stateMachine:ORCH_STACK-cleanup"]},
+    {"Sid": "ManageExecutions", "Effect": "Allow", "Action": ["states:DescribeExecution", "states:StopExecution"],
+     "Resource": ["arn:PARTITION:states:REGION:ACCOUNT_ID:execution:ORCH_STACK-cleanup:*",
+                  "arn:PARTITION:states:REGION:ACCOUNT_ID:execution:ORCH_STACK-orchestrator:*"]},
+    {"Sid": "ListExecutions", "Effect": "Allow", "Action": "states:ListExecutions",
+     "Resource": "arn:PARTITION:states:REGION:ACCOUNT_ID:stateMachine:ORCH_STACK-orchestrator"},
+    {"Sid": "FailureTopic", "Effect": "Allow", "Action": "sns:Subscribe",
+     "Resource": "arn:PARTITION:sns:REGION:ACCOUNT_ID:ORCH_STACK-failure-notifications"}
+  ]
+}
+```
+
+Compared with the default `LambdaExecutionRole`, this role has no IAM role-creation actions (child stacks create no roles), passes only the shared role, and has no `lakeformation:PutDataLakeSettings`. `ReadInputCsvAndTemplate` uses `*` because the input CSV and child template are given as URLs, and the orchestrator checks each bucket in the CSV, which is only known at run time; list those buckets instead if you know them in advance.
+
+Step Functions role trust policy:
+
+<!-- policy:orch-sfn-trust -->
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{"Effect": "Allow", "Principal": {"Service": "states.amazonaws.com"}, "Action": "sts:AssumeRole"}]
+}
+```
+
+Step Functions role permissions policy:
+
+<!-- policy:orch-sfn -->
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Sid": "InvokeOrchestratorFunctions", "Effect": "Allow", "Action": "lambda:InvokeFunction",
+     "Resource": ["arn:PARTITION:lambda:REGION:ACCOUNT_ID:function:ORCH_STACK-csv-parser",
+                  "arn:PARTITION:lambda:REGION:ACCOUNT_ID:function:ORCH_STACK-stack-manager",
+                  "arn:PARTITION:lambda:REGION:ACCOUNT_ID:function:ORCH_STACK-results-writer",
+                  "arn:PARTITION:lambda:REGION:ACCOUNT_ID:function:ORCH_STACK-cleanup-stop-executions",
+                  "arn:PARTITION:lambda:REGION:ACCOUNT_ID:function:ORCH_STACK-cleanup-find-stacks",
+                  "arn:PARTITION:lambda:REGION:ACCOUNT_ID:function:ORCH_STACK-cleanup-delete-one",
+                  "arn:PARTITION:lambda:REGION:ACCOUNT_ID:function:ORCH_STACK-cleanup-poll-one"]},
+    {"Sid": "StartChildExecutions", "Effect": "Allow", "Action": "states:StartExecution",
+     "Resource": ["arn:PARTITION:states:REGION:ACCOUNT_ID:stateMachine:ORCH_STACK-orchestrator",
+                  "arn:PARTITION:states:REGION:ACCOUNT_ID:stateMachine:ORCH_STACK-cleanup"]},
+    {"Sid": "ManageChildExecutions", "Effect": "Allow", "Action": ["states:DescribeExecution", "states:StopExecution"],
+     "Resource": ["arn:PARTITION:states:REGION:ACCOUNT_ID:execution:ORCH_STACK-orchestrator/*",
+                  "arn:PARTITION:states:REGION:ACCOUNT_ID:execution:ORCH_STACK-cleanup/*"]},
+    {"Sid": "ListExecutions", "Effect": "Allow", "Action": "states:ListExecutions",
+     "Resource": ["arn:PARTITION:states:REGION:ACCOUNT_ID:stateMachine:ORCH_STACK-orchestrator",
+                  "arn:PARTITION:states:REGION:ACCOUNT_ID:stateMachine:ORCH_STACK-cleanup"]},
+    {"Sid": "DistributedMapResults", "Effect": "Allow",
+     "Action": ["s3:PutObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
+     "Resource": "arn:PARTITION:s3:::RESULTS_BUCKET/intermediate/*"},
+    {"Sid": "VendedLogs", "Effect": "Allow",
+     "Action": ["logs:CreateLogDelivery", "logs:GetLogDelivery", "logs:UpdateLogDelivery", "logs:DeleteLogDelivery",
+                "logs:ListLogDeliveries", "logs:PutResourcePolicy", "logs:DescribeResourcePolicies", "logs:DescribeLogGroups"],
+     "Resource": "*"}
+  ]
+}
+```
+
+The Step Functions guide requires `*` for [log delivery to CloudWatch Logs](https://docs.aws.amazon.com/step-functions/latest/dg/cw-logs.html).
+
+**Deploying principal.** With supplied roles, the deploying principal needs no IAM role creation and no `lakeformation:PutDataLakeSettings`. It needs the CloudFormation, Lambda, Step Functions, Athena, CloudWatch Logs, SNS and EventBridge permissions for the resources in the template, plus:
+
+<!-- policy:orch-deployer-supplied-roles -->
+```json
+[
+  {"Sid": "PassOrchestratorLambdaRole", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "ORCH_LAMBDA_ROLE_ARN",
+   "Condition": {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}}},
+  {"Sid": "PassOrchestratorStepFunctionsRole", "Effect": "Allow", "Action": "iam:PassRole", "Resource": "ORCH_SFN_ROLE_ARN",
+   "Condition": {"StringEquals": {"iam:PassedToService": "states.amazonaws.com"}}}
+]
+```
+
+Switch between created and supplied roles only when the orchestrator has no child stacks. Existing child stacks keep the Lambda role they were created with for their Lake Formation revokes.
+
+## Organizations that restrict IAM role names
+
+If a service control policy (SCP) or permissions boundary rule blocks the role names CloudFormation generates, create the roles yourself, named and placed to meet your rules, and pass their ARNs. No template then creates an IAM role.
+
+| Template | Parameters to set |
+|---|---|
+| `s3-rollback.yaml` | `SharedIAMRoleArn` ([policy](#pre-created-shared-role)) |
+| `s3-rollback-glue-metadata.yaml` | `SharedIAMRoleArn` and `GlueJobRoleArn` ([policy](#large-scale-template-s3-rollback-glue-metadatayaml)) |
+| `s3-rollback-orchestrator.yaml` | `SharedIAMRoleArn`, `OrchestratorLambdaRoleArn` and `OrchestratorStepFunctionsRoleArn` ([policy](#pre-created-orchestrator-roles)) |
+
+Stack names must still start with the prefix your role policies are scoped to: `STACK_PREFIX` for the rollback templates, and `s3-rollback-` for the orchestrator's child stacks, which the orchestrator names itself.
 
 ## Large-scale template (`s3-rollback-glue-metadata.yaml`)
 

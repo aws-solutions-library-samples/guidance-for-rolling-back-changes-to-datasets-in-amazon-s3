@@ -59,8 +59,8 @@ In addition to the [Rollback Tool for Amazon S3 prerequisites](README.md#prerequ
 1. **Stage `s3-rollback.yaml` in S3.** Upload the `s3-rollback.yaml` template from this repository to an S3 bucket you control. The orchestrator references it by HTTPS URL (for example, `https://my-templates.s3.us-east-1.amazonaws.com/s3-rollback.yaml`). Make sure the URL is readable by CloudFormation in the account and region where you deploy the orchestrator.
 2. **Results bucket.** Create or identify a single S3 bucket to receive the orchestrator results CSV. It must be in the same region as the orchestrator stack. Each child stack creates its own temporary bucket for its manifests, Athena output, and S3 Batch Operations reports, so only the orchestrator's results CSV is written here.
 3. **Input CSV in S3.** Upload a CSV listing the buckets to process (see [Input CSV format](#input-csv-format)).
-4. **Deploying principal permissions.** See [Orchestrator](permissions.md#orchestrator-s3-rollback-orchestratoryaml) in the permissions guide. The orchestrator always creates its own two IAM roles and makes its `LambdaExecutionRole` a Lake Formation administrator, so the deploying principal needs IAM role creation and `lakeformation:GetDataLakeSettings` and `lakeformation:PutDataLakeSettings`. `LambdaExecutionRole` then creates the child stacks, scoped to the `s3-rollback-*` naming convention.
-5. **Lake Formation.** Child stacks make their Lake Formation grants by assuming `LambdaExecutionRole`, so no child role needs to be a Lake Formation administrator.
+4. **Deploying principal permissions.** See [Orchestrator](permissions.md#orchestrator-s3-rollback-orchestratoryaml) in the permissions guide. By default the orchestrator creates its own two IAM roles and makes its `LambdaExecutionRole` a Lake Formation administrator, so the deploying principal needs IAM role creation and `lakeformation:GetDataLakeSettings` and `lakeformation:PutDataLakeSettings`. `LambdaExecutionRole` then creates the child stacks, scoped to the `s3-rollback-*` naming convention. If your organization does not allow stacks to create IAM roles, supply the roles instead (see [Pre-created orchestrator roles](#pre-created-orchestrator-roles)).
+5. **Lake Formation.** Child stacks make their Lake Formation grants by assuming the orchestrator's Lambda role, so no child role needs to be a Lake Formation administrator.
 
 ## Input CSV format
 
@@ -106,6 +106,8 @@ Upload the CSV to S3 and note the URL. Both `s3://` and `https://` formats are a
 | **Start S3 Batch Operations Jobs** (`StartS3BatchOperationsJobs`) | No | `YES` to start the Batch Operations jobs automatically in each child stack, `NO` (default) to leave them paused for review. |
 | **Create Shared IAM Role** (`CreateSharedIAMRole`) | No | `YES` (default) to create one IAM role shared by all child stacks. `NO` means each child stack creates its own roles. Ignored if `SharedIAMRoleArn` is set. |
 | **Shared IAM Role ARN (existing)** (`SharedIAMRoleArn`) | No | ARN of an existing IAM role for all child stacks to use. Takes precedence over `CreateSharedIAMRole`. |
+| **Orchestrator Lambda role ARN (existing)** (`OrchestratorLambdaRoleArn`) | No | ARN of an existing role for the orchestrator's Lambda functions. Set together with `OrchestratorStepFunctionsRoleArn` and `SharedIAMRoleArn`, or leave blank. See [Pre-created orchestrator roles](#pre-created-orchestrator-roles). |
+| **Orchestrator Step Functions role ARN (existing)** (`OrchestratorStepFunctionsRoleArn`) | No | ARN of an existing role for the orchestrator and cleanup state machines. Set together with the two parameters above, or leave blank. |
 | **SNS email list** (`SNSEmailList`) | No | Comma-separated list of email addresses. When provided, the orchestrator creates an SNS topic and subscribes each address, then publishes a notification whenever the orchestrator or cleanup state machine ends in `FAILED`, `TIMED_OUT`, or `ABORTED`. Leave blank to skip. See [Failure notifications](#failure-notifications). |
 
 ### Shared IAM role
@@ -116,6 +118,12 @@ By default (`CreateSharedIAMRole` = `YES`), the orchestrator creates one role, `
 - Set `SharedIAMRoleArn` to a role you create, for example to reuse it across orchestrator runs or manage it outside CloudFormation. [Orchestrator](permissions.md#orchestrator-s3-rollback-orchestratoryaml) in the permissions guide gives its policy.
 
 If both are provided, `SharedIAMRoleArn` wins.
+
+### Pre-created orchestrator roles
+
+To deploy with no stack-created IAM roles at all, for example where a service control policy (SCP) only allows role names that match an approved pattern, create three roles and pass all three ARNs: `SharedIAMRoleArn`, `OrchestratorLambdaRoleArn` and `OrchestratorStepFunctionsRoleArn`. Neither the orchestrator nor any child stack then creates a role, and the orchestrator does not change the Lake Formation administrator list. [Pre-created orchestrator roles](permissions.md#pre-created-orchestrator-roles) in the permissions guide gives the trust and permission policies.
+
+If Lake Formation manages the account catalog or `s3tablescatalog`, make the Lambda role a data lake administrator before you deploy. Each run checks this before it creates any child stack. If the check fails, the execution fails at `ParseCSVFailed` with a cause that names the role; fix it and start the orchestrator again.
 
 ## Deploying
 
@@ -299,7 +307,7 @@ In Lake Formation-mode accounts, granting LF permissions from a child stack requ
 - LF enforces a per-account cap on the number of data lake admins.
 - `PutDataLakeSettings` is not safe under concurrency. Multiple child stacks racing to append themselves surfaces as `ConcurrentModificationException`.
 
-The orchestrator elevates its own `LambdaExecutionRole` to LF admin once, via `AWS::LakeFormation::DataLakeSettings` with `MutationType: APPEND`. It then passes that role ARN to each child stack as `LFAdminRoleArn`. Children use it to perform their grants without touching the admin list themselves, so the list stays small and the race disappears.
+The orchestrator elevates its own `LambdaExecutionRole` to LF admin once, via `AWS::LakeFormation::DataLakeSettings` with `MutationType: APPEND`. It then passes that role ARN to each child stack as `LFAdminRoleArn`. Children use it to perform their grants without touching the admin list themselves, so the list stays small and the race disappears. With [pre-created orchestrator roles](#pre-created-orchestrator-roles), the orchestrator passes your Lambda role instead and never changes the admin list; you make that role an admin yourself.
 
 ### Athena WorkGroup quota
 

@@ -85,6 +85,31 @@ Parameters:
     ConstraintDescription: Please enter a valid IAM role ARN or leave blank.
     Default: ""
 
+  OrchestratorLambdaRoleArn:
+    Type: String
+    Description: >-
+      Leave blank to let the stack create its own roles. To use an IAM role you created, enter
+      its ARN: every orchestrator Lambda function runs as it, CloudFormation creates and deletes
+      child stacks as it, and child stacks assume it for their Lake Formation grants. Set this,
+      OrchestratorStepFunctionsRoleArn and SharedIAMRoleArn together; the orchestrator and its
+      child stacks then create no IAM roles. If Lake Formation manages the account catalog or
+      s3tablescatalog, the role must already be a data lake administrator. Required permissions:
+      https://github.com/aws-solutions-library-samples/guidance-for-rolling-back-changes-to-datasets-in-amazon-s3/blob/main/permissions.md
+    AllowedPattern: '^(arn:(aws|aws-cn|aws-us-gov):iam::\d{12}:role/.+|)$'
+    ConstraintDescription: Must be an IAM role ARN, or blank.
+    Default: ""
+
+  OrchestratorStepFunctionsRoleArn:
+    Type: String
+    Description: >-
+      Leave blank to let the stack create its own roles. To use an IAM role you created for the
+      orchestrator and cleanup state machines, trusted by states.amazonaws.com, enter its ARN.
+      Set together with OrchestratorLambdaRoleArn and SharedIAMRoleArn. Required permissions:
+      https://github.com/aws-solutions-library-samples/guidance-for-rolling-back-changes-to-datasets-in-amazon-s3/blob/main/permissions.md
+    AllowedPattern: '^(arn:(aws|aws-cn|aws-us-gov):iam::\d{12}:role/.+|)$'
+    ConstraintDescription: Must be an IAM role ARN, or blank.
+    Default: ""
+
   SNSEmailList:
     Type: String
     Default: ""
@@ -109,8 +134,14 @@ Metadata:
         Label:
           default: "Optional parameters"
         Parameters:
-          - SharedIAMRoleArn
           - SNSEmailList
+      -
+        Label:
+          default: "Advanced: pre-created IAM roles"
+        Parameters:
+          - SharedIAMRoleArn
+          - OrchestratorLambdaRoleArn
+          - OrchestratorStepFunctionsRoleArn
 
 
     ParameterLabels:
@@ -130,6 +161,10 @@ Metadata:
         default: Create Shared IAM Role
       SharedIAMRoleArn:
         default: Shared IAM Role ARN (existing)
+      OrchestratorLambdaRoleArn:
+        default: Orchestrator Lambda role ARN (existing)
+      OrchestratorStepFunctionsRoleArn:
+        default: Orchestrator Step Functions role ARN (existing)
       SNSEmailList:
         default: Optional comma-separated list of email recipients that will be subscribed to SNS notifications for orchestrator failures.
 
@@ -141,11 +176,34 @@ Conditions:
   ShouldNotCreateSharedRole: !Not [!Condition ShouldCreateSharedRole]
   HasSNSEmailList: !Not [!Equals [!Ref SNSEmailList, ""]]
   HasNoSNSEmailList: !Equals [!Ref SNSEmailList, ""]
+  # Supplied mode: the customer provides both orchestrator roles and SharedIAMRoleArn (enforced
+  # by CheckOrchestratorRolesTogether), so neither this stack nor any child stack creates roles.
+  # Tests both ARNs (equivalent under the rule) so linters can resolve each !If branch.
+  UseSuppliedOrchestratorRoles: !And
+    - !Not [!Equals [!Ref OrchestratorLambdaRoleArn, ""]]
+    - !Not [!Equals [!Ref OrchestratorStepFunctionsRoleArn, ""]]
+  CreateOrchestratorRoles: !Not [!Condition UseSuppliedOrchestratorRoles]
+
+Rules:
+  CheckOrchestratorRolesTogether:
+    RuleCondition: !Or
+      - !Not [!Equals [!Ref OrchestratorLambdaRoleArn, ""]]
+      - !Not [!Equals [!Ref OrchestratorStepFunctionsRoleArn, ""]]
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref OrchestratorLambdaRoleArn, ""]]
+          - !Not [!Equals [!Ref OrchestratorStepFunctionsRoleArn, ""]]
+          - !Not [!Equals [!Ref SharedIAMRoleArn, ""]]
+        AssertDescription: >-
+          OrchestratorLambdaRoleArn, OrchestratorStepFunctionsRoleArn and SharedIAMRoleArn
+          must all be set together, or OrchestratorLambdaRoleArn and
+          OrchestratorStepFunctionsRoleArn both left blank.
 
 Resources:
 
   LambdaExecutionRole:
     Type: AWS::IAM::Role
+    Condition: CreateOrchestratorRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -542,7 +600,7 @@ Resources:
                 Action:
                   - "sts:AssumeRole"
                 Resource:
-                  - !GetAtt LambdaExecutionRole.Arn
+                  - !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorLambdaRoleArn, !GetAtt LambdaExecutionRole.Arn]
               # KMS - update key policies of customer managed keys listed in the input CSV
               - Effect: Allow
                 Action:
@@ -560,6 +618,7 @@ Resources:
 
   StepFunctionsExecutionRole:
     Type: AWS::IAM::Role
+    Condition: CreateOrchestratorRoles
     Properties:
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
@@ -675,7 +734,7 @@ Resources:
       Handler: index.handler
       Timeout: 30
       MemorySize: 128
-      Role: !GetAtt LambdaExecutionRole.Arn
+      Role: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorLambdaRoleArn, !GetAtt LambdaExecutionRole.Arn]
       Code:
         ZipFile: |
           import boto3
@@ -714,8 +773,11 @@ Resources:
   # Elevate LambdaExecutionRole to LF data lake admin so CFN can create Glue
   # databases in child stacks when the account is in Lake Formation mode.
   # MutationType: APPEND preserves any existing admins.
+  # Not created for a supplied OrchestratorLambdaRoleArn: the stack never elevates a role the
+  # customer owns. CsvParserFunction checks the supplied role is an admin when LF needs it.
   OrchestratorLFAdmin:
     Type: AWS::LakeFormation::DataLakeSettings
+    Condition: CreateOrchestratorRoles
     Properties:
       Admins:
         - DataLakePrincipalIdentifier: !GetAtt LambdaExecutionRole.Arn
@@ -817,7 +879,7 @@ Resources:
       Handler: index.handler
       Timeout: 60
       MemorySize: 256
-      Role: !GetAtt LambdaExecutionRole.Arn
+      Role: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorLambdaRoleArn, !GetAtt LambdaExecutionRole.Arn]
       Environment:
         Variables:
           # Stagger settings (hardcoded, not CFN parameters — avoids cluttering
@@ -835,6 +897,11 @@ Resources:
           # Each row is assigned wg-<index % WORKGROUP_POOL_SIZE>.
           WORKGROUP_POOL_SIZE: "10"
           WORKGROUP_NAME_PREFIX: !Sub "${AWS::StackName}-wg-"
+          # Supplied-role mode only: the role to check is a Lake Formation admin before any
+          # child stack is created. Passed explicitly because sts:GetCallerIdentity returns the
+          # assumed-role ARN, which drops the role's path.
+          LF_CHECK_ROLE_ARN: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorLambdaRoleArn, ""]
+          ACCOUNT_ID: !Ref AWS::AccountId
       Code:
         ZipFile: |
           import boto3
@@ -842,8 +909,16 @@ Resources:
           import io
           import os
           import re
+          from botocore.exceptions import ClientError
 
           s3 = boto3.client('s3')
+          lf = boto3.client('lakeformation')
+          glue = boto3.client('glue')
+
+          LF_CHECK_ROLE_ARN = os.environ.get('LF_CHECK_ROLE_ARN', '')
+          ACCOUNT_ID = os.environ.get('ACCOUNT_ID', '')
+          PERMISSIONS_URL = ("https://github.com/aws-solutions-library-samples/"
+                             "guidance-for-rolling-back-changes-to-datasets-in-amazon-s3/blob/main/permissions.md")
 
           BUCKET_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]$')
 
@@ -911,7 +986,79 @@ Resources:
               else:
                   raise ValueError(f"Invalid S3 URL: {url}")
 
+          # Same rule as LFPermissionsGranter.detect_mode in s3-rollback.yaml; keep them identical.
+          def detect_mode(settings):
+              principals = [
+                  p["Principal"]["DataLakePrincipalIdentifier"]
+                  for p in settings.get("CreateTableDefaultPermissions", [])
+                  if p.get("Principal")
+              ]
+              if "IAM_ALLOWED_PRINCIPALS" in principals:
+                  return "IAM_Mode"
+              return "LF_Mode"
+
+          def region():
+              return os.environ.get("AWS_REGION", "")
+
+          def access_error(what, permission, err):
+              return RuntimeError(
+                  f"The role {LF_CHECK_ROLE_ARN} cannot read {what} to check whether Lake Formation "
+                  f"manages it: {err}. Grant the role {permission}. See {PERMISSIONS_URL}")
+
+          def s3tables_catalog_mode():
+              """LF mode of s3tablescatalog/aws-s3. A missing catalog is not in LF mode: accounts
+              using S3 Inventory or a CSV inventory may have no S3 Tables integration."""
+              catalog_id = f"{ACCOUNT_ID}:s3tablescatalog/aws-s3"
+              try:
+                  catalog = glue.get_catalog(CatalogId=catalog_id).get("Catalog", {})
+              except ClientError as e:
+                  code = e.response.get("Error", {}).get("Code", "")
+                  if code == "EntityNotFoundException":
+                      return "IAM_Mode"
+                  if code == "AccessDeniedException":
+                      # In LF mode, LF itself denies GetCatalog to a non-admin without DESCRIBE
+                      # ("Insufficient Lake Formation permission(s)"), which shows LF manages it.
+                      if "Lake Formation" in e.response.get("Error", {}).get("Message", ""):
+                          return "LF_Mode"
+                      raise access_error("s3tablescatalog/aws-s3", "glue:GetCatalog on it", e) from e
+                  raise
+              return detect_mode({"CreateTableDefaultPermissions":
+                                  catalog.get("CreateTableDefaultPermissions", [])})
+
+          def check_lf_admin():
+              """Supplied-role mode: fail before any child stack exists if Lake Formation manages a
+              catalog and the supplied orchestrator Lambda role is not a data lake admin. Child
+              stacks create their Glue database and make their LF grants as this role."""
+              if not LF_CHECK_ROLE_ARN:
+                  return
+              try:
+                  settings = lf.get_data_lake_settings(CatalogId=ACCOUNT_ID)["DataLakeSettings"]
+              except ClientError as e:
+                  if e.response.get("Error", {}).get("Code", "") == "AccessDeniedException":
+                      raise access_error("the Lake Formation settings",
+                                         "lakeformation:GetDataLakeSettings", e) from e
+                  raise
+              admins = [a.get("DataLakePrincipalIdentifier")
+                        for a in settings.get("DataLakeAdmins", [])]
+              if LF_CHECK_ROLE_ARN in admins:
+                  return
+              lf_catalogs = []
+              if detect_mode(settings) == "LF_Mode":
+                  lf_catalogs.append("the account catalog")
+              if s3tables_catalog_mode() == "LF_Mode":
+                  lf_catalogs.append("s3tablescatalog/aws-s3")
+              if not lf_catalogs:
+                  return
+              raise RuntimeError(
+                  f"Lake Formation manages permissions on {' and '.join(lf_catalogs)}, and the role "
+                  f"{LF_CHECK_ROLE_ARN} (OrchestratorLambdaRoleArn) is not a Lake Formation data lake "
+                  f"administrator in {region()}. Child stacks create their Glue databases and make "
+                  f"their Lake Formation grants as this role. Make it a data lake administrator in "
+                  f"{region()}, then start the orchestrator again. No child stacks were created. "
+                  f"See {PERMISSIONS_URL}")
+
           def handler(event, context):
+              check_lf_admin()
               s3_url = event['S3CsvUrl']
               bucket, key = parse_s3_url(s3_url)
 
@@ -1017,7 +1164,7 @@ Resources:
       Handler: index.handler
       Timeout: 300
       MemorySize: 256
-      Role: !GetAtt LambdaExecutionRole.Arn
+      Role: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorLambdaRoleArn, !GetAtt LambdaExecutionRole.Arn]
       Environment:
         Variables:
           RESULTS_BUCKET: !Ref ResultsBucket
@@ -1027,7 +1174,7 @@ Resources:
           TIMESTAMP: !Ref TimeStamp
           MODE: !Ref Mode
           ORCHESTRATOR_STACK_ID: !Ref AWS::StackId
-          LF_ADMIN_ROLE_ARN: !GetAtt LambdaExecutionRole.Arn
+          LF_ADMIN_ROLE_ARN: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorLambdaRoleArn, !GetAtt LambdaExecutionRole.Arn]
       Code:
         ZipFile: |
           import boto3
@@ -1317,7 +1464,7 @@ Resources:
       Handler: index.handler
       Timeout: 300
       MemorySize: 512
-      Role: !GetAtt LambdaExecutionRole.Arn
+      Role: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorLambdaRoleArn, !GetAtt LambdaExecutionRole.Arn]
       Environment:
         Variables:
           RESULTS_BUCKET: !Ref ResultsBucket
@@ -1470,7 +1617,7 @@ Resources:
     Type: AWS::StepFunctions::StateMachine
     Properties:
       StateMachineName: !Sub "${AWS::StackName}-orchestrator"
-      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      RoleArn: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorStepFunctionsRoleArn, !GetAtt StepFunctionsExecutionRole.Arn]
       LoggingConfiguration:
         Level: ALL
         IncludeExecutionData: true
@@ -1507,10 +1654,15 @@ Resources:
                 {
                   "ErrorEquals": ["States.ALL"],
                   "ResultPath": "$.ErrorInfo",
-                  "Next": "ExecutionFailed"
+                  "Next": "ParseCSVFailed"
                 }
               ],
               "Next": "MapOverRows"
+            },
+            "ParseCSVFailed": {
+              "Type": "Fail",
+              "Error": "OrchestratorExecutionFailed",
+              "CausePath": "$.ErrorInfo.Cause"
             },
             "MapOverRows": {
               "Type": "Map",
@@ -1871,7 +2023,7 @@ Resources:
       Handler: index.handler
       Timeout: 60
       MemorySize: 128
-      Role: !GetAtt LambdaExecutionRole.Arn
+      Role: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorLambdaRoleArn, !GetAtt LambdaExecutionRole.Arn]
       Code:
         ZipFile: |
           import boto3
@@ -1920,7 +2072,7 @@ Resources:
       Handler: index.handler
       Timeout: 300
       MemorySize: 256
-      Role: !GetAtt LambdaExecutionRole.Arn
+      Role: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorLambdaRoleArn, !GetAtt LambdaExecutionRole.Arn]
       Code:
         ZipFile: |
           import boto3
@@ -2001,7 +2153,7 @@ Resources:
       Handler: index.handler
       Timeout: 120
       MemorySize: 128
-      Role: !GetAtt LambdaExecutionRole.Arn
+      Role: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorLambdaRoleArn, !GetAtt LambdaExecutionRole.Arn]
       Code:
         ZipFile: |
           import boto3
@@ -2059,7 +2211,7 @@ Resources:
       Handler: index.handler
       Timeout: 120
       MemorySize: 128
-      Role: !GetAtt LambdaExecutionRole.Arn
+      Role: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorLambdaRoleArn, !GetAtt LambdaExecutionRole.Arn]
       Code:
         ZipFile: |
           import boto3
@@ -2142,7 +2294,7 @@ Resources:
       Handler: index.handler
       Timeout: 900
       MemorySize: 128
-      Role: !GetAtt LambdaExecutionRole.Arn
+      Role: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorLambdaRoleArn, !GetAtt LambdaExecutionRole.Arn]
       Code:
         ZipFile: |
           import boto3
@@ -2218,7 +2370,7 @@ Resources:
     Type: AWS::StepFunctions::StateMachine
     Properties:
       StateMachineName: !Sub "${AWS::StackName}-cleanup"
-      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      RoleArn: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorStepFunctionsRoleArn, !GetAtt StepFunctionsExecutionRole.Arn]
       LoggingConfiguration:
         Level: ERROR
         IncludeExecutionData: false
@@ -2489,7 +2641,7 @@ Resources:
       Handler: index.handler
       Timeout: 30
       MemorySize: 128
-      Role: !GetAtt LambdaExecutionRole.Arn
+      Role: !If [UseSuppliedOrchestratorRoles, !Ref OrchestratorLambdaRoleArn, !GetAtt LambdaExecutionRole.Arn]
       Code:
         ZipFile: |
           import boto3
@@ -2498,8 +2650,22 @@ Resources:
 
           sfn = boto3.client('stepfunctions')
 
+          # Properties that only order this resource against others. A change to them alone
+          # (for example LFAdminGate appearing when an older stack is updated) must not
+          # start a new run.
+          ORDERING_ONLY = ('ServiceToken', 'LFAdminGate')
+
+          def run_inputs(props):
+              return {k: v for k, v in (props or {}).items() if k not in ORDERING_ONLY}
+
           def handler(event, context):
               if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              if (event['RequestType'] == 'Update'
+                      and run_inputs(event.get('OldResourceProperties')) == run_inputs(event['ResourceProperties'])):
+                  print("Only ordering properties changed; not starting a new execution.")
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
                   return
 
@@ -2529,14 +2695,17 @@ Resources:
     # parallel with the trigger, causing child stack DELETE_FAILED.
     # OrchestratorLFAdmin must also outlive the trigger: child stacks revoke their
     # LF grants on deletion by assuming LambdaExecutionRole, which needs to still
-    # be a data lake admin at that point.
+    # be a data lake admin at that point. OrchestratorLFAdmin is conditional, and
+    # DependsOn cannot name a resource whose condition is false, so the dependency
+    # comes from the LFAdminGate property reference instead (same on all four
+    # resources that must wait for it).
     DependsOn:
       - CleanupStateMachine
       - OrchestratorStateMachine
       - ChildStackExecutionRole
-      - OrchestratorLFAdmin
     Properties:
       ServiceToken: !GetAtt CleanupTriggerFunction.Arn
+      LFAdminGate: !If [CreateOrchestratorRoles, !Ref OrchestratorLFAdmin, !Ref "AWS::NoValue"]
       OrchestratorStackId: !Ref AWS::StackId
       OrchestratorStateMachineArn: !Ref OrchestratorStateMachine
       CleanupStateMachineArn: !Ref CleanupStateMachine
@@ -2547,9 +2716,9 @@ Resources:
     DependsOn:
       - CleanupStateMachine
       - OrchestratorStateMachine
-      - OrchestratorLFAdmin
     Properties:
       ServiceToken: !GetAtt CleanupTriggerFunction.Arn
+      LFAdminGate: !If [CreateOrchestratorRoles, !Ref OrchestratorLFAdmin, !Ref "AWS::NoValue"]
       OrchestratorStackId: !Ref AWS::StackId
       OrchestratorStateMachineArn: !Ref OrchestratorStateMachine
       CleanupStateMachineArn: !Ref CleanupStateMachine
@@ -2559,10 +2728,10 @@ Resources:
     Condition: HasSNSEmailList
     DependsOn:
       - OrchestratorStateMachine
-      - OrchestratorLFAdmin
       - OrchestratorFailureRule
     Properties:
       ServiceToken: !GetAtt AutoStartFunction.Arn
+      LFAdminGate: !If [CreateOrchestratorRoles, !Ref OrchestratorLFAdmin, !Ref "AWS::NoValue"]
       StateMachineArn: !Ref OrchestratorStateMachine
       ExecutionInput:
         S3CsvUrl: !Ref S3CsvUrl
@@ -2576,9 +2745,9 @@ Resources:
     Condition: HasNoSNSEmailList
     DependsOn:
       - OrchestratorStateMachine
-      - OrchestratorLFAdmin
     Properties:
       ServiceToken: !GetAtt AutoStartFunction.Arn
+      LFAdminGate: !If [CreateOrchestratorRoles, !Ref OrchestratorLFAdmin, !Ref "AWS::NoValue"]
       StateMachineArn: !Ref OrchestratorStateMachine
       ExecutionInput:
         S3CsvUrl: !Ref S3CsvUrl

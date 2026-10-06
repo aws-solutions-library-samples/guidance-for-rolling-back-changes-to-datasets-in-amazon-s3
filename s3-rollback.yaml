@@ -660,6 +660,7 @@ Resources:
           from botocore.exceptions import ClientError
 
           PERMISSIONS_URL = "https://github.com/aws-solutions-library-samples/guidance-for-rolling-back-changes-to-datasets-in-amazon-s3/blob/main/permissions.md"
+          S3TABLES_INTEGRATION_URL = "https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-tables-integrating-aws.html"
 
           def get_lf_client(props):
               """Return an LF client. If LFAdminRoleArn is provided, assume that role."""
@@ -713,6 +714,20 @@ Resources:
                   catalog = response.get("Catalog", {})
                   defaults = catalog.get("CreateTableDefaultPermissions", [])
                   return detect_mode({"CreateTableDefaultPermissions": defaults})
+              except ClientError as e:
+                  if e.response.get("Error", {}).get("Code") == "EntityNotFoundException":
+                      # The S3 Tables integration with AWS analytics services is not enabled, so
+                      # there is no catalog to read the namespace from. Say so now rather than
+                      # fail later granting on a namespace that cannot be found.
+                      raise RuntimeError(
+                          f"The catalog {catalog_id.partition(':')[2]} does not exist in {region()}. "
+                          f"The S3 Metadata tables are read through the S3 Tables integration with AWS "
+                          f"analytics services, which is not enabled in this account and Region. Enable "
+                          f"it, then deploy again. See {S3TABLES_INTEGRATION_URL}"
+                      ) from e
+                  # Any other error, including Lake Formation refusing a non-admin the read, means
+                  # Lake Formation manages the catalog.
+                  return "LF_Mode"
               except Exception:
                   return "LF_Mode"
 
