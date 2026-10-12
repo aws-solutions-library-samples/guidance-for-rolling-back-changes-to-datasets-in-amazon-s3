@@ -94,7 +94,7 @@ For example, as of 2026-04-01, if you use this tool in 'Bucket Rollback' mode ag
 | [Amazon S3](https://aws.amazon.com/s3/pricing/) | COPY requests | $5 |
 | [S3 Batch Operations](https://aws.amazon.com/s3/pricing/) | Jobs and objects processed | $4 |
 | [AWS Lambda](https://aws.amazon.com/lambda/pricing/) | Compute time and requests | $1 |
-| [S3 Metadata](https://aws.amazon.com/s3/pricing/) (if enabled) | Journal table updates | $0.90 |
+| [S3 Metadata](https://aws.amazon.com/s3/pricing/) | Journal table updates | $0.90 |
 
 If using the large-scale template (`s3-rollback-glue-metadata.yaml`) with default settings (40 G.8X workers), add approximately **$2** for the [AWS Glue](https://aws.amazon.com/glue/) Spark job that computes the point-in-time table. See [AWS Glue pricing](https://aws.amazon.com/glue/pricing/).
 
