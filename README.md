@@ -456,7 +456,7 @@ S3 Batch Operations calls two Lambda functions in this tool, once per object. Bo
 | Function | Used by | Memory | Median duration per object | Lambda cost per million |
 |---|---|---|---|---|
 | `S3BatchOpsDeleteFunction` | Scenarios 1, 2 and 4 (add and remove delete markers) | 256 MB | 26 to 28 ms, almost all of it the S3 `DeleteObject` request | $0.32 to $0.34 |
-| `S3BatchOpsCopyFunction` | Scenario 3c (versions over 5 GB in Bucket Rollback mode) and Scenario 5b (every object in Copy to Bucket mode) | 1,024 MB | 4.1 s for 6 GB (23 parts, copied in parallel); 11 to 17 s for 50 GB; 63 to 72 s for 1 TB | $55 for 6 GB; $840 to $960 for 1 TB |
+| `S3BatchOpsCopyFunction` | Scenario 3c (versions over 5 GB in Bucket Rollback mode) and Scenario 5b (every object in Copy to Bucket mode) | 1,024 MB | 4.1 s for 6 GB (23 parts, copied in parallel); 11 to 17 s for 50 GB; 63 to 72 s for 1 TB | $55 (6 GB objects); $840 to $960 (1 TB objects) |
 
 - **Copy.** In Bucket Rollback mode this function restores only versions over 5 GB (Scenario 3c); Scenario 3b (overwritten versions up to 5 GB) uses the native S3 Batch Operations copy. Copy to Bucket mode uses the function for every object. Duration depends on the object size and on S3. The largest version tested, 5 TiB, took 102 to 108 s, against the function's 900 s timeout. S3 allows objects up to 48.8 TiB; versions over 5 TiB were not tested. The times are for copies within one Region.
 - **Delete.** Jobs of 9 to 10 million delete markers ran at 3,300 to 4,900 tasks per second. A job of 100 million took 3.5 hours, about 7,900 tasks per second, close to Lambda's request-rate limit (10 times the concurrency quota). S3 and that limit set the rate. A function that runs in under about 100 ms does not change it.
