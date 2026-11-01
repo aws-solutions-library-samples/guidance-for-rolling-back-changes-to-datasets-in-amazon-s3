@@ -25,3 +25,5 @@ cdk.out
 **/data/**.csv
 
 .env
+# Rust build output (delete-function-rust)
+delete-function-rust/target/

@@ -98,6 +98,8 @@ Or this one when you pass `SharedIAMRoleArn`:
  "Condition": {"StringEquals": {"iam:PassedToService": "lambda.amazonaws.com"}}}
 ```
 
+**Rust delete function (optional).** If you set `DeleteFunctionCodeBucket` and `DeleteFunctionCodeKey` (see [Deploying the delete function in Rust](performance.md#deploying-the-delete-function-in-rust)), CloudFormation reads the zip file with the deploying principal's credentials, so that principal also needs `s3:GetObject` on `arn:PARTITION:s3:::CODE_BUCKET/CODE_KEY`. The function's own role is unchanged and needs no access to the zip.
+
 ### Pre-created shared role
 
 Pass the role's ARN as **Shared IAM role ARN** (`SharedIAMRoleArn`). Every Lambda function in the stack runs as this role, and every S3 Batch Operations job uses it, so the stack creates no IAM roles.

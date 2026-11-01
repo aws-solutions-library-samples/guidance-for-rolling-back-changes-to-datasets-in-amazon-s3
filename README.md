@@ -31,6 +31,7 @@
 - [KMS permissions](#kms-permissions)
 - [IAM permissions](permissions.md)
 - [AWS Lambda concurrency reservations](#aws-lambda-concurrency-reservations)
+- [Lambda function performance](#lambda-function-performance)
 - [FAQs](#faqs)
 - [Cleanup](#cleanup)
 - [Tenets](#tenets)
@@ -86,7 +87,7 @@ The tool will not permanently delete any data. In the default 'Bucket Rollback' 
 
 You are responsible for the cost of the AWS services used while running this Guidance. 
 
-For example, as of 2026-04-01, if you use this tool in 'Bucket Rollback' mode against an entire bucket in the US East (N. Virginia) Region containing 1 billion objects and with S3 Metadata live inventory enabled or an existing Amazon S3 Inventory, to roll back 1 million non-overwrite PUTs, 1 million overwrite PUTs (of objects in Standard or Intelligent-Tiering classes`*`) *and* 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $12**, detailed in the following table: 
+For example, as of 2026-10-31, if you use this tool in 'Bucket Rollback' mode against an entire bucket in the US East (N. Virginia) Region containing 1 billion objects and with S3 Metadata live inventory enabled or an existing Amazon S3 Inventory, to roll back 1 million non-overwrite PUTs, 1 million overwrite PUTs (of objects in Standard or Intelligent-Tiering classes`*`) *and* 1 million DELETEs since the desired point-in-time, **the total cost would be approximately $12**, detailed in the following table: 
 
 | AWS service | Dimensions | Cost [USD] |
 |-------------|------------|------------|
@@ -94,7 +95,8 @@ For example, as of 2026-04-01, if you use this tool in 'Bucket Rollback' mode ag
 | [Amazon S3](https://aws.amazon.com/s3/pricing/) | COPY requests | $5 |
 | [S3 Batch Operations](https://aws.amazon.com/s3/pricing/) | Jobs and objects processed | $4 |
 | [AWS Lambda](https://aws.amazon.com/lambda/pricing/) | Compute time and requests | $1 |
-| [S3 Metadata](https://aws.amazon.com/s3/pricing/) | Journal table updates | $0.90 |
+| [Amazon CloudWatch Logs](https://aws.amazon.com/cloudwatch/pricing/) | Log data ingested from the Lambda functions | $0.34 |
+| [S3 Metadata](https://aws.amazon.com/s3/pricing/) (if enabled) | Journal table updates | $0.90 |
 
 If using the large-scale template (`s3-rollback-glue-metadata.yaml`) with default settings (40 G.8X workers), add approximately **$2** for the [AWS Glue](https://aws.amazon.com/glue/) Spark job that computes the point-in-time table. See [AWS Glue pricing](https://aws.amazon.com/glue/pricing/).
 
@@ -102,7 +104,10 @@ If using the large-scale template (`s3-rollback-glue-metadata.yaml`) with defaul
 - Additional storage charges for copies are not included in the above estimates.
 - Athena charges can be expected to scale with objects in the inventory.
 - Following the [simple demo](#simple-demo) costs $1.
-- In testing, deleting 100 million delete markers incurred $36 in Lambda charges. Lambda compute time is higher for COPY than DELETE operations, and scales with object size.
+- In testing, removing delete markers cost $0.34 per million tasks in Lambda charges, about $34 for 100 million. The charge rises when S3 slows requests, because the function retries them and the retry time is billed.
+- Lambda charges are higher for COPY than for DELETE operations. The copy function has 1,024 MB of memory (the delete function has 256 MB). In Bucket Rollback mode it runs only for versions over 5 GB, and the charge grows with object size: about $55 per million copies of 6 GB versions, and $0.0008 to $0.001 for one 1 TB version.
+- S3 Batch Operations charges $1.00 per million objects and $0.25 per job: about $100 for 100 million objects, the largest cost at that scale.
+- The CloudWatch Logs line is for the 2 million Lambda tasks in the example (Scenarios 1 and 2). Each invocation logs about 0.34 KB, which costs about $0.17 per million tasks at $0.50 per GB ingested. The log groups are kept when the stack is deleted and never expire, so storage charges continue until you delete them. See [Cleanup](#cleanup).
 - 'Copy to Bucket' mode copies every object (that was current at the timestamp) using S3 Batch Operations and Lambda. Cross-region copies will incur cross-region data transfer charges, and the lower throughput may increase Lambda compute time.
 - S3 does not charge for DELETE operations.
 - If the CloudFormation stack is not deleted after rollback is complete, ongoing S3 storage charges will apply for the temporary S3 bucket. See [Cleanup](#cleanup).
@@ -136,7 +141,7 @@ If using the large-scale template (`s3-rollback-glue-metadata.yaml`) with defaul
             - In mixed-mode environments (e.g. account in IAM mode but `s3tablescatalog` in LF mode), the tool grants permissions only where LF is enforcing.
         - If your S3 Metadata tables use a customer managed KMS key, specify it during deployment using the **S3 Metadata tables KMS key** parameter.
     - If S3 Metadata is not configured on your bucket, the tool will attempt to detect and use an existing [S3 Inventory](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html).
-        - S3 Inventory reports are supported in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format, when including all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). They must not be stored with [KMS encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html). See [Deployment workflow](#deployment-workflow) for additional detail.
+        - S3 Inventory reports are supported in [Parquet or Apache ORC](https://docs.aws.amazon.com/athena/latest/ug/columnar-storage.html) format, when including all versions as well as all [additional metadata](https://docs.aws.amazon.com/AmazonS3/latest/userguide/configure-inventory.html#configure-inventory-console). They must not be stored with [KMS encryption](https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingKMSEncryption.html). See [Deployment workflow](#deployment-workflow-detail) for additional detail.
     - An inventory list can be provided manually, and will be used in preference of the above. See the section [Creating a real-time inventory using the ListObjectVersions API](#creating-a-real-time-inventory-using-the-listobjectversions-api).
 
 4. **The operations you want to roll back must be included in the inventory**. 
@@ -193,7 +198,7 @@ The principal that deploys the stack needs the permissions listed in [Deploying 
 
 > There may be object versions that need to be copied to complete the recovery, but are in an asynchronous [S3 storage class](https://aws.amazon.com/s3/storage-classes/) (i.e. Glacier Flexible Retrieval or Glacier Deep Archive). This tool will not retrieve and copy these, but will output their details in a CSV manifest `scenario3a.csv` or  `scenario5a.csv`, in the S3 path referenced in the `Manifests` output, that can be used with the solution [**Guidance for Automated Restore and Copy for Amazon S3 Glacier Objects**](https://github.com/aws-solutions-library-samples/guidance-for-automated-restore-and-copy-for-amazon-s3-glacier-objects).
 
-When you no longer need the manifests and other artifacts created by the tool, see the [Cleaning up](#cleaning-up) section.
+When you no longer need the manifests and other artifacts created by the tool, see the [Cleanup](#cleanup) section.
 
 ## Large-scale template (s3-rollback-glue-metadata.yaml)
 
@@ -445,6 +450,20 @@ The **S3 Metadata tables KMS key** is separate. If your S3 Metadata tables (jour
 The Lambda functions created by this tool (for use with S3 Batch Operations) have been tested with up to 1000 concurrent executions. Please see [Lambda quotas](https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html) in the AWS documentation.
 
 
+## Lambda function performance
+S3 Batch Operations calls two Lambda functions in this tool, once per object. Both run Python 3.13 on arm64 (Graviton).
+
+| Function | Used by | Memory | Median duration per object | Lambda cost per million |
+|---|---|---|---|---|
+| `S3BatchOpsDeleteFunction` | Scenarios 1, 2 and 4 (add and remove delete markers) | 256 MB | 26 to 28 ms, almost all of it the S3 `DeleteObject` request | $0.32 to $0.34 |
+| `S3BatchOpsCopyFunction` | Scenario 3c (versions over 5 GB in Bucket Rollback mode) and Scenario 5b (every object in Copy to Bucket mode) | 1,024 MB | 4.1 s for 6 GB (23 parts, copied in parallel); 11 to 17 s for 50 GB; 63 to 72 s for 1 TB | $55 for 6 GB; $840 to $960 for 1 TB |
+
+- **Copy.** In Bucket Rollback mode this function restores only versions over 5 GB (Scenario 3c); Scenario 3b (overwritten versions up to 5 GB) uses the native S3 Batch Operations copy. Copy to Bucket mode uses the function for every object. Duration depends on the object size and on S3. The largest version tested, 5 TiB, took 102 to 108 s, against the function's 900 s timeout. S3 allows objects up to 48.8 TiB; versions over 5 TiB were not tested. The times are for copies within one Region.
+- **Delete.** Jobs of 9 to 10 million delete markers ran at 3,300 to 4,900 tasks per second. A job of 100 million took 3.5 hours, about 7,900 tasks per second, close to Lambda's request-rate limit (10 times the concurrency quota). S3 and that limit set the rate. A function that runs in under about 100 ms does not change it.
+- **Rust.** An optional Rust build of the delete function is about 3 ms faster per object and costs 17% to 37% less in Lambda charges. It does not make a job finish sooner at the default Lambda quota. Build and deployment steps are in [performance.md](performance.md#deploying-the-delete-function-in-rust).
+
+[performance.md](performance.md) has the measurements, the reasons the delete function is written in Python, and what limits job duration. The figures come from one account and Region. Yours depend on object sizes, key layout and S3 request rates.
+
 ## FAQs
 
 1. What did I need to have in place prior to an event that I want to recover from, in order to use this tool?
@@ -492,7 +511,7 @@ The Lambda functions created by this tool (for use with S3 Batch Operations) hav
 
 As the tool is deployed once per use, it should be removed once the jobs are complete and the reports, tables and manifests are no longer required.
 
-To clean up, delete the CloudFormation stack. This will delete any CSV manifests generated by the tool (which might be required for undo - see FAQ 3), as well as all the resources it created.
+To clean up, delete the CloudFormation stack. This will delete any CSV manifests generated by the tool (which might be required for undo - see FAQ 3), as well as all the resources it created, except the CloudWatch log groups. These are kept under `/aws/lambda/s3-rollback/<stack name>/` so you can review the logs. Delete them when you no longer need them, for example with `aws logs delete-log-group --log-group-name <name>`.
 
 ## Tenets
 
@@ -550,6 +569,12 @@ To clean up, delete the CloudFormation stack. This will delete any CSV manifests
     - `s3-rollback-orchestrator.yaml`: accepts `OrchestratorLambdaRoleArn` and `OrchestratorStepFunctionsRoleArn`. Set with `SharedIAMRoleArn`, the orchestrator and its child stacks create no IAM roles, for organizations whose SCPs restrict role names. The orchestrator does not make a supplied role a Lake Formation administrator; each run checks the role first and fails before creating child stacks if it needs to be one. A failed CSV parse now reports its cause in the execution. See [Organizations that restrict IAM role names](permissions.md#organizations-that-restrict-iam-role-names).
     - `s3-rollback.yaml`: when the S3 Tables integration with AWS analytics services is not enabled, the stack now fails with a message that says so and links to the AWS documentation, instead of "Database not found".
 
+- 2026-11-01
+    - `s3-rollback.yaml` and `s3-rollback-glue-metadata.yaml`: `S3BatchOpsCopyFunction` has 1,024 MB of memory, down from 2,048 MB. Copies of versions from 6 GB to 5 TiB completed in tests, and the Lambda charge for a 6 GB version is 47% lower ($55 per million copies against $104) for a copy that takes about 5% longer. Updating a stack changes only the function's memory setting.
+    - `s3-rollback.yaml` and `s3-rollback-glue-metadata.yaml`: `S3BatchOpsDeleteFunction` and `S3BatchOpsCopyFunction` run on arm64 (Graviton). The code is unchanged. The Lambda charge is about 9% lower per delete task and 22% to 27% lower per copy.
+    - `s3-rollback.yaml` and `s3-rollback-glue-metadata.yaml`: new optional parameters `DeleteFunctionCodeBucket` and `DeleteFunctionCodeKey` run `S3BatchOpsDeleteFunction` from a Rust build instead of the inline Python. Blank by default, so existing deployments are unchanged.
+    - Added [delete-function-rust](delete-function-rust), with steps to deploy it in [performance.md](performance.md#deploying-the-delete-function-in-rust).
+    - Added [Lambda function performance](#lambda-function-performance) and [performance.md](performance.md): measured durations for both functions, why the delete function is written in Python, what Rust would gain, and what limits job duration.
 ## Notices
 
 Customers are responsible for making their own independent assessment of the information in this Guidance. This Guidance: (a) is for informational purposes only, (b) represents AWS current product offerings and practices, which are subject to change without notice, and (c) does not create any commitments or assurances from AWS and its affiliates, suppliers or licensors. AWS products or services are provided “as is” without warranties, representations, or conditions of any kind, whether express or implied. AWS responsibilities and liabilities to its customers are controlled by AWS agreements, and this Guidance is not part of, nor does it modify, any agreement between AWS and its customers.

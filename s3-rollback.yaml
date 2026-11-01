@@ -113,6 +113,26 @@ Parameters:
       the per-account WorkGroup quota. Leave blank when deploying this template directly.
     Default: ""
 
+  DeleteFunctionCodeBucket:
+    Type: String
+    Description: >-
+      Advanced. Leave blank to use the built-in Python function that adds and removes delete
+      markers (Scenarios 1, 2 and 4). To use the optional Rust build instead, enter the S3 bucket
+      that holds its arm64 zip file. The bucket must be in the same Region as this stack. Build
+      and upload steps:
+      https://github.com/aws-solutions-library-samples/guidance-for-rolling-back-changes-to-datasets-in-amazon-s3/blob/main/performance.md#deploying-the-delete-function-in-rust
+    AllowedPattern: '^([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])?$'
+    ConstraintDescription: Enter an S3 bucket name, or leave blank to use the Python function.
+    Default: ""
+  DeleteFunctionCodeKey:
+    Type: String
+    Description: >-
+      Advanced. The key of the Rust arm64 zip file in DeleteFunctionCodeBucket, for example
+      s3-rollback/delete-function-1.zip. Use a new key for each build: CloudFormation does not
+      redeploy a function whose key is unchanged. Set together with DeleteFunctionCodeBucket.
+    AllowedPattern: '^(.+\.zip)?$'
+    ConstraintDescription: Enter the key of a .zip file, or leave blank to use the Python function.
+    Default: ""
 Metadata:
   AWS::CloudFormation::Interface:
     ParameterGroups:
@@ -142,7 +162,17 @@ Metadata:
           - SharedIAMRoleArn
           - LFAdminRoleArn
 
+      -
+        Label:
+          default: "Advanced: Rust delete function"
+        Parameters:
+          - DeleteFunctionCodeBucket
+          - DeleteFunctionCodeKey
     ParameterLabels:
+        DeleteFunctionCodeBucket:
+          default: Rust delete function code bucket
+        DeleteFunctionCodeKey:
+          default: Rust delete function code key
         SharedIAMRoleArn:
           default: Pre-created IAM role ARN
         LFAdminRoleArn:
@@ -169,6 +199,9 @@ Metadata:
           default: Destination Bucket
 
 Conditions:
+  UseRustDeleteFunction: !And
+    - !Not [!Equals [!Ref DeleteFunctionCodeBucket, ""]]
+    - !Not [!Equals [!Ref DeleteFunctionCodeKey, ""]]
   UseKmsUpdateKeyPolicy: !Not [!Equals [!Ref ExistingKmsKeyIdOrArn, ""]]
   UseSharedWorkGroup: !Not [!Equals [!Ref SharedAthenaWorkGroupName, ""]]
   CreateOwnWorkGroup: !Equals [!Ref SharedAthenaWorkGroupName, ""]
@@ -246,6 +279,17 @@ Conditions:
     - !Not [ !Condition CreateKMSUpdate ]
 
 Rules:
+  CheckDeleteFunctionCode:
+    RuleCondition: !Or
+      - !Not [!Equals [!Ref DeleteFunctionCodeBucket, ""]]
+      - !Not [!Equals [!Ref DeleteFunctionCodeKey, ""]]
+    Assertions:
+      - Assert: !And
+          - !Not [!Equals [!Ref DeleteFunctionCodeBucket, ""]]
+          - !Not [!Equals [!Ref DeleteFunctionCodeKey, ""]]
+        AssertDescription: >-
+          DeleteFunctionCodeBucket and DeleteFunctionCodeKey must both be set to use the Rust
+          delete function, or both left blank to use the Python function.
 
   CheckForDestinationBucket:
     RuleCondition: !Equals
@@ -3377,81 +3421,85 @@ Resources:
     Properties:
       LoggingConfig:
         LogGroup: !Ref S3BatchOpsDeleteFunctionLogGroup
-      Runtime: python3.13
-      MemorySize: 256
+      Runtime: !If [UseRustDeleteFunction, provided.al2023, python3.13]
+      Architectures:
+        - arm64
+      MemorySize: !If [UseRustDeleteFunction, 128, 256]
       Timeout: 900
-      Handler: "index.handler"
+      Handler: !If [UseRustDeleteFunction, bootstrap, "index.handler"]
       Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsDeleteFunctionRole.Arn]
-      Code:
-        ZipFile: |
-          import boto3
-          import botocore.config
-          from urllib.parse import unquote_plus
-          from botocore.exceptions import ClientError
-          
-          # Configure S3 client with 10 retry attempts
-          client_config = botocore.config.Config(
-              retries={
-                  'max_attempts': 10,
-                  'mode': 'standard'
-              }
-          )
-          s3 = boto3.client('s3', config=client_config)
-          
-          def handler(event, context):
-          
-              results = {
-                  'invocationSchemaVersion': event['invocationSchemaVersion'],
-                  'treatMissingKeysAs': 'PermanentFailure',
-                  'invocationId': event['invocationId'],
-                  'results': []
-              }
-              
-              for task in event['tasks']:
-          
-                  task_id = task['taskId']
-                  s3_bucket = task['s3Bucket']
-                  s3_key = unquote_plus(task['s3Key'])
-                  s3_version_id = task.get('s3VersionId', None)
-          
-                  result = {'taskId' : task_id }
-          
-                  try:           
-                      # Delete the object
-                      if s3_version_id:
-                        s3.delete_object(Bucket=s3_bucket, Key=s3_key, VersionId=s3_version_id)
-                      else:
-                        s3.delete_object(Bucket=s3_bucket, Key=s3_key, IfMatch='*')                      
-          
-                      result['resultCode'] = "Succeeded"
-                      result['resultString'] = "Deleted"
-                  
-                  except ClientError as e:
-                      # Handle specific S3 errors
-                      error_code = e.response['Error']['Code']
-                      error_message = e.response['Error']['Message']
-                      request_id = e.response['ResponseMetadata']['RequestId']
-                      http_status_code = e.response['ResponseMetadata']['HTTPStatusCode']
-                      retry_attempts = e.response['ResponseMetadata']['RetryAttempts']
-                  
-                      if error_code == 'NoSuchKey':
-                          # Object doesn't exist - might have been deleted already
-                          result['resultCode'] = "Succeeded"
-                          result['resultString'] = "Not found."
-                          
-                      elif error_code == 'AccessDenied':
-                          # Permission issues
-                          result['resultCode'] = "PermanentFailure"
-                          result['resultString'] = f"Access denied. RequestID = {request_id}."
-          
-                      else:
-                          # Other client errors
-                          result['resultCode'] = "PermanentFailure"
-                          result['resultString'] = f"{error_code} - {error_message}. HTTP Status Code = {http_status_code}. Retry Attempts = {retry_attempts}. RequestID = {request_id}."
-          
-                  results['results'].append(result)
-              return results
+      Code: !If
+        - UseRustDeleteFunction
+        - S3Bucket: !Ref DeleteFunctionCodeBucket
+          S3Key: !Ref DeleteFunctionCodeKey
+        - ZipFile: |
+            import boto3
+            import botocore.config
+            from urllib.parse import unquote_plus
+            from botocore.exceptions import ClientError
 
+            # Configure S3 client with 10 retry attempts
+            client_config = botocore.config.Config(
+                retries={
+                    'max_attempts': 10,
+                    'mode': 'standard'
+                }
+            )
+            s3 = boto3.client('s3', config=client_config)
+
+            def handler(event, context):
+
+                results = {
+                    'invocationSchemaVersion': event['invocationSchemaVersion'],
+                    'treatMissingKeysAs': 'PermanentFailure',
+                    'invocationId': event['invocationId'],
+                    'results': []
+                }
+                
+                for task in event['tasks']:
+
+                    task_id = task['taskId']
+                    s3_bucket = task['s3Bucket']
+                    s3_key = unquote_plus(task['s3Key'])
+                    s3_version_id = task.get('s3VersionId', None)
+
+                    result = {'taskId' : task_id }
+
+                    try:           
+                        # Delete the object
+                        if s3_version_id:
+                          s3.delete_object(Bucket=s3_bucket, Key=s3_key, VersionId=s3_version_id)
+                        else:
+                          s3.delete_object(Bucket=s3_bucket, Key=s3_key, IfMatch='*')                      
+
+                        result['resultCode'] = "Succeeded"
+                        result['resultString'] = "Deleted"
+                    
+                    except ClientError as e:
+                        # Handle specific S3 errors
+                        error_code = e.response['Error']['Code']
+                        error_message = e.response['Error']['Message']
+                        request_id = e.response['ResponseMetadata']['RequestId']
+                        http_status_code = e.response['ResponseMetadata']['HTTPStatusCode']
+                        retry_attempts = e.response['ResponseMetadata']['RetryAttempts']
+                    
+                        if error_code == 'NoSuchKey':
+                            # Object doesn't exist - might have been deleted already
+                            result['resultCode'] = "Succeeded"
+                            result['resultString'] = "Not found."
+                            
+                        elif error_code == 'AccessDenied':
+                            # Permission issues
+                            result['resultCode'] = "PermanentFailure"
+                            result['resultString'] = f"Access denied. RequestID = {request_id}."
+
+                        else:
+                            # Other client errors
+                            result['resultCode'] = "PermanentFailure"
+                            result['resultString'] = f"{error_code} - {error_message}. HTTP Status Code = {http_status_code}. Retry Attempts = {retry_attempts}. RequestID = {request_id}."
+
+                    results['results'].append(result)
+                return results
   S3BatchOpsDeleteFunctionRole:
     Condition: CreateOwnS3BatchOpsDeleteFunctionRole
     Type: "AWS::IAM::Role"
@@ -3499,7 +3547,9 @@ Resources:
       LoggingConfig:
         LogGroup: !Ref S3BatchOpsCopyFunctionLogGroup
       Runtime: python3.13
-      MemorySize: 2048
+      Architectures:
+        - arm64
+      MemorySize: 1024
       Timeout: 900
       Handler: "index.handler"
       Role: !If [UseSharedIAMRole, !Ref SharedIAMRoleArn, !GetAtt S3BatchOpsCopyFunctionRole.Arn]
