@@ -12,6 +12,7 @@
 - [When to Use This Tool](#when-to-use-this-tool)
 - [Prerequisites](#prerequisites)
 - [Deploying and Running the Guidance](#deploying-and-running-the-guidance)
+  - [Confirming S3 Metadata has caught up](#confirming-s3-metadata-has-caught-up)
   - [Large-scale template (s3-rollback-glue-metadata.yaml)](#large-scale-template-s3-rollback-glue-metadatayaml)
   - [Running against multiple buckets (s3-rollback-orchestrator.yaml)](#running-against-multiple-buckets-s3-rollback-orchestratoryaml)
 - [How it works](#how-it-works)
@@ -146,12 +147,12 @@ If using the large-scale template (`s3-rollback-glue-metadata.yaml`) with defaul
 
 4. **The operations you want to roll back must be included in the inventory**. 
     - S3 Inventory reports are delivered daily (or weekly), are eventually consistent, and might not include recently added or deleted objects. This can add more than a day to the start of your recovery time.
-    - S3 Metadata support combines the live inventory table with the latest updates from the journal table, for the fastest start to your rollback.
+    - S3 Metadata support combines the live inventory table with recent journal table records that have not yet been merged into it, for the fastest start to your rollback. Journal records are written in near real time, but S3 does not publish a maximum delay, and records can appear in a different order to the changes they describe. Order does not affect the result, because the tool orders records by `sequence_number` and `last_modified_date`. A change whose record has not been written when the tool runs is not included. Before you deploy, stop changes to the bucket or prefix in scope and wait at least 15 minutes after the last change. See [Confirming S3 Metadata has caught up](#confirming-s3-metadata-has-caught-up).
 5. For 'Copy to Bucket' mode, the destination bucket must already exist and have S3 Versioning enabled. This destination bucket, or the prefix in scope, **should be empty**. It can be in any AWS Region. If your destination bucket is in a different AWS Account, see the note in [Copy to Bucket mode](#copy-to-bucket-mode-1).
 
 ## Deploying and Running the Guidance
 
-Before reverting changes, you may wish to prevent further changes taking place, for example with an update to your [bucket policy](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-policies.html) to deny PUT and DELETE operations (other than by roles created by this tool). You should also [temporarily disable any lifecycle expiry rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-configuration-examples.html#lifecycle-config-conceptual-ex2) to prevent objects being deleted during recovery. Then, deploy the [CloudFormation template](s3-rollback.yaml) in the same AWS Region as the S3 bucket you want to roll back or copy from. During deployment, specify:
+Before reverting changes, you may wish to prevent further changes taking place, for example with an update to your [bucket policy](https://docs.aws.amazon.com/AmazonS3/latest/userguide/bucket-policies.html) to deny PUT and DELETE operations (other than by roles created by this tool). If you use S3 Metadata, see [Confirming S3 Metadata has caught up](#confirming-s3-metadata-has-caught-up) for an example policy and checks to run before you start any jobs. You should also [temporarily disable any lifecycle expiry rules](https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-configuration-examples.html#lifecycle-config-conceptual-ex2) to prevent objects being deleted during recovery. Then, deploy the [CloudFormation template](s3-rollback.yaml) in the same AWS Region as the S3 bucket you want to roll back or copy from. During deployment, specify:
 
 1. **Bucket**: The name of the bucket to roll back or copy from.
 2. **TimeStamp**: The date and time to roll back to *in the UTC timezone*, in ISO `yyyy-mm-ddThh:mm:ss` format. For example: `2025-08-30T02:00:00`.
@@ -199,6 +200,36 @@ The principal that deploys the stack needs the permissions listed in [Deploying 
 > There may be object versions that need to be copied to complete the recovery, but are in an asynchronous [S3 storage class](https://aws.amazon.com/s3/storage-classes/) (i.e. Glacier Flexible Retrieval or Glacier Deep Archive). This tool will not retrieve and copy these, but will output their details in a CSV manifest `scenario3a.csv` or  `scenario5a.csv`, in the S3 path referenced in the `Manifests` output, that can be used with the solution [**Guidance for Automated Restore and Copy for Amazon S3 Glacier Objects**](https://github.com/aws-solutions-library-samples/guidance-for-automated-restore-and-copy-for-amazon-s3-glacier-objects).
 
 When you no longer need the manifests and other artifacts created by the tool, see the [Cleanup](#cleanup) section.
+
+## Confirming S3 Metadata has caught up
+
+No query can prove the journal table holds every change, because S3 does not publish a maximum delay for journal records. These steps give strong evidence before you run any jobs.
+
+1. **Stop changes to the data in scope.** Stopping your application may not be enough, because other clients and S3 Replication can still write. A bucket policy that denies writes to everyone except your administrators stops them:
+   ```json
+   {
+     "Version": "2012-10-17",
+     "Statement": [{
+       "Sid": "FreezePrefixForRollback",
+       "Effect": "Deny",
+       "Principal": "*",
+       "Action": ["s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"],
+       "Resource": "arn:aws:s3:::<bucket>/<prefix>*",
+       "Condition": {"ArnNotLike": {"aws:PrincipalArn": ["arn:aws:iam::<account>:role/<admin-role>"]}}
+     }]
+   }
+   ```
+   S3 Lifecycle actions are not controlled by bucket policies. Check your Lifecycle rules for expirations that could act on the data in scope.
+2. **Write a canary object** under the prefix in scope, after the last change, for example `<prefix>rollback-canary-<UTC time>`.
+3. **Wait until the canary appears in the journal table**, then wait at least 15 more minutes:
+   ```sql
+   SELECT record_timestamp, record_type
+   FROM "s3tablescatalog/aws-s3"."<namespace>"."journal"
+   WHERE key = '<prefix>rollback-canary-<UTC time>';
+   ```
+   Records are not guaranteed to be written in order, so earlier changes can still arrive after the canary. The extra wait allows for that.
+4. **Deploy with Start S3 Batch Operations Jobs set to `FALSE`.** In Bucket Rollback mode, the Scenario 1 job will add a delete marker to the canary.
+5. **Before running jobs, add the tool's roles to the policy exemption.** These are `S3BatchOpsExecutorRole`, `S3BatchOpsDeleteFunctionRole` and `S3BatchOpsCopyFunctionRole`, found on the stack's Resources tab, or the role you supplied in **Shared IAM role ARN**. Without them, copy tasks fail with `AccessDenied` and delete tasks fail with `PermanentFailure: Access denied`. In Copy to Bucket mode the tool only reads the source bucket, so no exemption is needed there.
 
 ## Large-scale template (s3-rollback-glue-metadata.yaml)
 
@@ -470,6 +501,7 @@ S3 Batch Operations calls two Lambda functions in this tool, once per object. Bo
     - See [Prerequisites](#prerequisites).
 2. What about changes that took place after the inventory was created, or after the rollback process was started?
     - This tool will take the appropriate action to revert changes, based on the available inventory information at the time of deployment. The impact of a subsequent change depends on its nature, and whether it took place before or after the specific S3 Batch Operations job (created  by this rollback tool) took its action. However, in all cases, running the rollback tool *again*, with an inventory that includes new changes, will correctly revert the new changes. Note: If the new inventory includes copies made by this tool (scenarios 3 and 5), those copies will be repeated as it isn't possible to be certain (from an inventory) that the current object version's data is identical to the desired version.
+    - To check a completed rollback, wait at least 15 minutes after the last job finishes, then deploy again with the same timestamp. The Scenario 1, 2 and 4 manifests should be empty. Any entries are changes the first run did not see, or changes made since. The Scenario 3 and 5 manifests will repeat the earlier copies, as described above.
 3. I used this tool to roll back my bucket, and want to undo the changes. Can I do that?
     - Yes, provided you have not yet deleted the CloudFormation stack from the original deployment. 
     - For Bucket Rollback mode, This is a 2-step process:
@@ -575,6 +607,7 @@ To clean up, delete the CloudFormation stack. This will delete any CSV manifests
     - `s3-rollback.yaml` and `s3-rollback-glue-metadata.yaml`: new optional parameters `DeleteFunctionCodeBucket` and `DeleteFunctionCodeKey` run `S3BatchOpsDeleteFunction` from a Rust build instead of the inline Python. Blank by default, so existing deployments are unchanged.
     - Added [delete-function-rust](delete-function-rust), with steps to deploy it in [performance.md](performance.md#deploying-the-delete-function-in-rust).
     - Added [Lambda function performance](#lambda-function-performance) and [performance.md](performance.md): measured durations for both functions, why the delete function is written in Python, what Rust would gain, and what limits job duration.
+- 2026-11-21 - Added [Confirming S3 Metadata has caught up](#confirming-s3-metadata-has-caught-up): how to check the journal table includes the changes to roll back before running jobs, and how to check a completed rollback.
 ## Notices
 
 Customers are responsible for making their own independent assessment of the information in this Guidance. This Guidance: (a) is for informational purposes only, (b) represents AWS current product offerings and practices, which are subject to change without notice, and (c) does not create any commitments or assurances from AWS and its affiliates, suppliers or licensors. AWS products or services are provided “as is” without warranties, representations, or conditions of any kind, whether express or implied. AWS responsibilities and liabilities to its customers are controlled by AWS agreements, and this Guidance is not part of, nor does it modify, any agreement between AWS and its customers.
