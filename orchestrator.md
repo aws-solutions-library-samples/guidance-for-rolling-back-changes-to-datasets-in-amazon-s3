@@ -101,7 +101,7 @@ Upload the CSV to S3 and note the URL. Both `s3://` and `https://` formats are a
 | **Buckets to roll back** (`S3CsvUrl`) | Yes | S3 URL of the input CSV (`s3://bucket/key.csv` or an equivalent `https://` URL). |
 | **Rollback Template S3 URL** (`TemplateS3Url`) | Yes | HTTPS URL of `s3-rollback.yaml` staged in S3. Must end in `.yaml`. |
 | **Results Bucket** (`ResultsBucket`) | Yes | S3 bucket name where the orchestrator writes its results CSV under `results/`. Each child stack creates its own temporary bucket for manifests, Athena output, and Batch Operations reports. |
-| **Rollback Timestamp** (`TimeStamp`) | Yes | Point-in-time in UTC ISO format `yyyy-mm-ddThh:mm:ss`. Applied to every child stack. |
+| **Rollback Timestamp** (`TimeStamp`) | Yes | Point-in-time in UTC ISO format `yyyy-mm-ddThh:mm:ss`, to 1-second granularity. A change made during this second is kept. Applied to every child stack. |
 | **Execution Mode** (`Mode`) | Yes | One of `Bucket Rollback` or `Delete Marker Removal`. Default: `Delete Marker Removal`. `Copy to Bucket` is not supported — see [Limitations](#limitations). See [Scenarios covered](README.md#scenarios-covered). |
 | **Start S3 Batch Operations Jobs** (`StartS3BatchOperationsJobs`) | No | `YES` to start the Batch Operations jobs automatically in each child stack, `NO` (default) to leave them paused for review. |
 | **Create Shared IAM Role** (`CreateSharedIAMRole`) | No | `YES` (default) to create one IAM role shared by all child stacks. `NO` means each child stack creates its own roles. Ignored if `SharedIAMRoleArn` is set. |
